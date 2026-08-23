@@ -414,6 +414,15 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
     budget = TokenBudget()
     repo_context = load_repo_context(repo_path) if repo_path else None
     workspace_root = OUTPUT_DIR / datetime.now().strftime("%Y%m%d-%H%M%S")
+    # Tests live in tests/ and import modules written at the workspace root
+    # (the normal Python layout). pytest won't put that root on sys.path by
+    # itself, so without this every such task fails at collection with
+    # ModuleNotFoundError no matter what the Coder writes.
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    (workspace_root / "conftest.py").write_text(
+        "import sys, pathlib\nsys.path.insert(0, str(pathlib.Path(__file__).parent))\n",
+        encoding="utf-8",
+    )
 
     print(f"Planner  : {models['planner']}")
     print(f"Tester   : {models['tester']}")
@@ -538,6 +547,13 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
             return 1
 
         verdict, reasoning = extract_verdict(review)
+        # Hard gate: no role may approve while the test suite is red. Personas
+        # are told this, but prompt instructions are advisory — enforce it in
+        # code so a false APPROVE can't exit 0 on broken output.
+        if verdict == "APPROVE" and not sandbox_result["passed"]:
+            print("  (APPROVE overridden — tests are still failing)")
+            verdict = "REJECT"
+            reasoning = f"Tests are still failing, so this cannot be approved:\n{sandbox_result['stderr'] or sandbox_result['stdout']}"
         print(f"  Verdict: {verdict}")
         history.append({"round": str(round_no), "attempt": attempt, "review": review, "verdict": verdict})
 
@@ -552,6 +568,9 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
             try:
                 review = complete(client, budget, models["reviewer"], reviewer_persona, retry_prompt, temperature=0.2)
                 verdict, reasoning = extract_verdict(review)
+                if verdict == "APPROVE" and not sandbox_result["passed"]:
+                    verdict = "REJECT"
+                    reasoning = "Tests are still failing, so this cannot be approved."
                 print(f"  Verdict (retry): {verdict}")
                 if verdict == "APPROVE":
                     _write_output(task, history, approved=True)
@@ -567,10 +586,17 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
             arbiter_user = f"Task:\n{task}\n\nCriteria:\n{criteria}\n\nRounds 1-3:\n"
             for h in history[-3:]:
                 arbiter_user += f"\nAttempt {h['round']}:\n{h['attempt'][:300]}\nReviewer: {h['review'][:200]}\n"
-            arbiter_user += f"\nFinal attempt:\n{attempt[:500]}\n\nBreak the deadlock."
+            arbiter_user += f"\nFinal attempt:\n{attempt[:500]}\n\n"
+            # The Arbiter was previously asked to rule on test-driven work
+            # without ever being shown the test results.
+            arbiter_user += f"Test results for the final attempt:\n{test_note}\n\nBreak the deadlock."
             try:
                 arbiter_review = complete(client, budget, models["arbiter"], arbiter_persona, arbiter_user, temperature=0.2)
                 arbiter_verdict, arbiter_reasoning = extract_verdict(arbiter_review)
+                if arbiter_verdict == "APPROVE" and not sandbox_result["passed"]:
+                    print("  (Arbiter APPROVE overridden — tests are still failing)")
+                    arbiter_verdict = "REJECT"
+                    arbiter_reasoning = "Tests are still failing, so this cannot be approved."
                 print(f"  Arbiter: {arbiter_verdict}")
                 history.append({"round": "arbiter", "attempt": attempt, "review": arbiter_review, "verdict": arbiter_verdict})
                 if arbiter_verdict == "APPROVE":
