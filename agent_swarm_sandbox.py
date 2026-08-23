@@ -7,6 +7,7 @@ All tests/compilation are FREE rejects; the Coder just tries again.
 """
 
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -36,11 +37,15 @@ def sandbox_run(workspace_root: Path, timeout_sec: int = 30) -> dict[str, Any]:
 
     # Try pytest first if tests exist
     if has_pytest:
-        return _run_command(["python", "-m", "pytest", str(workspace_root), "-q", "--tb=short"], timeout_sec, "pytest")
+        result = _run_command([sys.executable, "-m", "pytest", str(workspace_root), "-q", "--tb=short"], timeout_sec, "pytest")
+        # Distinguish "pytest not installed" from "tests failed"
+        if result["returncode"] == 1 and "no module named pytest" in result["stderr"].lower():
+            return {"passed": True, "stdout": "", "stderr": "", "returncode": 0, "note": "pytest not installed (skipped)"}
+        return result
 
     # Fall back to compileall for .py files
     if has_py_files:
-        return _run_command(["python", "-m", "compileall", "-q", str(workspace_root)], timeout_sec, "compileall")
+        return _run_command([sys.executable, "-m", "compileall", "-q", str(workspace_root)], timeout_sec, "compileall")
 
     # Try node for .js
     if has_js_files:

@@ -302,12 +302,13 @@ def extract_verdict(review: str) -> tuple[str, str]:
     if verdict_text is None:
         return ("UNPARSEABLE", stripped)
 
-    # Reasoning is everything after the verdict line
+    # Reasoning is everything after the verdict line; if nothing follows,
+    # fall back to lines before it (some models front-load reasoning).
     reasoning = "\n".join(lines[verdict_line_idx + 1:]).strip()
+    if not reasoning:
+        reasoning = "\n".join(lines[:verdict_line_idx]).strip()
     return (verdict_text, reasoning)
 
-
-VERDICT_RE = re.compile(r"VERDICT:\s*(APPROVE|REJECT)", re.IGNORECASE)  # legacy, kept for reference
 
 
 def parse_and_write_files(coder_output: str, workspace_root: Path) -> list[Path]:
@@ -355,6 +356,9 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
 
     coder_persona = load_persona("coder.md")
     reviewer_persona = load_persona("reviewer.md")
+    rubric_path = ROOT / "RUBRIC.md"
+    if rubric_path.exists():
+        reviewer_persona = reviewer_persona + "\n\n" + rubric_path.read_text(encoding="utf-8")
     budget = TokenBudget()
     repo_context = load_repo_context(repo_path) if repo_path else None
 
@@ -431,9 +435,13 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
             return 0
 
         if verdict == "UNPARSEABLE":
-            # Retry once with a terse re-prompt, don't count as a round burn
+            # Retry once with context; don't count as a round burn
             print("  Verdict line unclear; requesting clarification...")
-            retry_prompt = f"Please re-state your verdict clearly on a single line:\nVERDICT: APPROVE or VERDICT: REJECT\n\nThen provide your brief reasoning."
+            retry_prompt = (
+                f"Task:\n{task}\n\nCoder's submission (excerpt):\n{attempt[:500]}\n\n"
+                f"Your previous response did not contain a parseable VERDICT: line.\n"
+                f"Please respond with EXACTLY this format:\nVERDICT: APPROVE\nor\nVERDICT: REJECT\n\nThen one sentence of reasoning."
+            )
             try:
                 review = complete(client, budget, models["reviewer"], reviewer_persona, retry_prompt, temperature=0.2)
                 verdict, reasoning = extract_verdict(review)
