@@ -60,8 +60,12 @@ OUTPUT_DIR = ROOT / "swarm_output"
 # Run `python verify_key.py` after editing it.
 # ---------------------------------------------------------------------------
 MODEL_REGISTRY: dict[str, list[str]] = {
+    "planner": ["openai/gpt-oss-20b", "openai/gpt-oss-120b"],
+    "tester": ["groq/compound-mini", "groq/compound"],
     "coder": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"],
+    "security": ["openai/gpt-oss-safeguard-20b", "groq/compound"],
     "reviewer": ["qwen/qwen3.6-27b", "groq/compound-mini"],
+    "arbiter": ["groq/compound", "groq/compound-mini"],
 }
 
 TPM_LIMIT = 8000  # Groq's per-model-per-minute cap
@@ -92,11 +96,18 @@ def resolve_models(client: Groq) -> dict[str, str]:
             )
         resolved[role] = pick
 
+    # Enforce family diversity: coder ≠ reviewer, coder ≠ tester, arbiter ≠ coder/reviewer
     if family_of(resolved["coder"]) == family_of(resolved["reviewer"]):
         raise RuntimeError(
-            f"Coder ({resolved['coder']}) and Reviewer ({resolved['reviewer']}) resolved to the "
-            f"same model family. CLAUDE.md requires them to differ — add a candidate to "
-            f"MODEL_REGISTRY['reviewer'] from a different family."
+            f"Coder ({resolved['coder']}) and Reviewer ({resolved['reviewer']}) must differ in family."
+        )
+    if family_of(resolved["coder"]) == family_of(resolved["tester"]):
+        raise RuntimeError(
+            f"Coder ({resolved['coder']}) and Tester ({resolved['tester']}) must differ in family."
+        )
+    if family_of(resolved["arbiter"]) in {family_of(resolved["coder"]), family_of(resolved["reviewer"])}:
+        raise RuntimeError(
+            f"Arbiter ({resolved['arbiter']}) must differ from both Coder and Reviewer."
         )
     return resolved
 
@@ -226,9 +237,9 @@ def _find_truncation_point(text: str, max_chars: int) -> int:
 def _fit_user_text(system: str, user: str, budget: TokenBudget) -> str:
     """If system + user + the minimum floor completion would already blow
     the per-request cap, truncate user (the variable-length part — usually
-    the coder's prior attempt) intelligently rather than let the request 413.
+    feedback + prior attempt) intelligently rather than let the request 413.
     Truncates in the middle at a good break point, not the tail."""
-    floor = 512
+    floor = 2000  # match completion_cap's target; reasoning models need headroom
     available_for_user = (budget.limit_per_request - floor) - estimate_tokens(system)
     available_chars = max(0, available_for_user * 3)  # inverse of estimate_tokens' ceil(len/3)
     if len(user) <= available_chars:
@@ -327,9 +338,11 @@ def parse_and_write_files(coder_output: str, workspace_root: Path) -> list[Path]
         file_path_str = parts[i].strip()
         content = parts[i + 1]
 
-        # Security: reject paths that try to escape
+        # Security: reject paths that try to escape or overwrite tests
         if ".." in file_path_str or file_path_str.startswith("/"):
             raise RuntimeError(f"Unsafe file path: {file_path_str}")
+        if file_path_str.startswith("tests/") or file_path_str.startswith("tests\\"):
+            raise RuntimeError(f"Coder cannot write to tests/: {file_path_str}. Tester writes all tests.")
 
         file_path = workspace_root / file_path_str
         file_path.parent.mkdir(parents=True, exist_ok=True)
@@ -352,51 +365,87 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
         print(f"[FAIL] {exc}")
         return 1
 
+    # Load all personas
     coder_persona = load_persona("coder.md")
     reviewer_persona = load_persona("reviewer.md")
+    planner_persona = load_persona("planner.md")
+    tester_persona = load_persona("tester.md")
+    security_persona = load_persona("security.md")
+    arbiter_persona = load_persona("arbiter.md")
+
     rubric_path = ROOT / "RUBRIC.md"
     if rubric_path.exists():
         reviewer_persona = reviewer_persona + "\n\n" + rubric_path.read_text(encoding="utf-8")
+
     budget = TokenBudget()
     repo_context = load_repo_context(repo_path) if repo_path else None
+    workspace_root = OUTPUT_DIR / datetime.now().strftime("%Y%m%d-%H%M%S")
 
+    print(f"Planner  : {models['planner']}")
+    print(f"Tester   : {models['tester']}")
     print(f"Coder    : {models['coder']}")
+    print(f"Security : {models['security']}")
     print(f"Reviewer : {models['reviewer']}")
+    print(f"Arbiter  : {models['arbiter']}")
     if repo_context:
         print(f"Repo     : {repo_path}\n")
     else:
         print()
 
+    # Phase 1: Planner writes acceptance criteria
+    print("--- planning ---")
+    try:
+        print("  Planner is thinking...")
+        criteria = complete(client, budget, models["planner"], planner_persona, f"Task:\n{task}", temperature=0.3)
+    except RuntimeError as exc:
+        print(f"[FAIL] {exc}")
+        return 1
+
+    # Phase 2: Tester writes tests based on criteria
+    print("--- testing (independent) ---")
+    try:
+        print("  Tester is writing tests...")
+        tester_user = f"Acceptance criteria:\n{criteria}\n\nWrite tests based on these criteria, not implementation."
+        tests_output = complete(client, budget, models["tester"], tester_persona, tester_user, temperature=0.3)
+        try:
+            parse_and_write_files(tests_output, workspace_root)
+            print("  Tests written to workspace/tests/")
+        except RuntimeError as exc:
+            print(f"[FAIL] Tester output invalid: {exc}")
+            return 1
+    except RuntimeError as exc:
+        print(f"[FAIL] {exc}")
+        return 1
+
+    # Phase 3: Main loop — Coder revises until approved
     feedback = ""
     attempt = ""
-    history: list[dict[str, str]] = []  # every round, not just the last — this is the audit trail
-    workspace_root = OUTPUT_DIR / datetime.now().strftime("%Y%m%d-%H%M%S")
+    security_passed = False
+    history: list[dict[str, str]] = []
 
     for round_no in range(1, max_rounds + 1):
         print(f"--- round {round_no} ---")
-        coder_user = ""
+        coder_user = f"Acceptance criteria:\n{criteria}\n\nTask:\n{task}"
         if repo_context and round_no == 1:
-            coder_user += f"You are working in this repository:\n{repo_context}\n\n"
-        coder_user += f"Task:\n{task}"
+            coder_user = f"Repository:\n{repo_context}\n\n" + coder_user
         if feedback:
-            coder_user += f"\n\nThe reviewer rejected your last attempt. Their feedback:\n{feedback}\n\nRevise accordingly."
+            coder_user += f"\n\nFeedback from prior round:\n{feedback}\n\nRevise accordingly."
 
         try:
             print("  Coder is working...")
             attempt = complete(client, budget, models["coder"], coder_persona, coder_user, temperature=0.3)
 
-            # Parse and write files from Coder output
-            print("  Writing and testing files...")
+            # Parse and write files (excluding tests, which are Tester's domain)
+            print("  Writing implementation...")
             try:
                 written_files = parse_and_write_files(attempt, workspace_root)
                 if written_files:
                     print(f"    Wrote {len(written_files)} file(s)")
             except RuntimeError as exc:
-                # File path was unsafe or parsing failed; feed this to Reviewer as a reject
                 print(f"    File write failed: {exc}")
                 written_files = []
 
-            # Run tests/compilation in the workspace
+            # Run Tester's tests against Coder's implementation
             sandbox_result = sandbox_run(workspace_root, timeout_sec=30)
             test_note = f"Test result: {sandbox_result['note']} (exit code {sandbox_result['returncode']})"
             if sandbox_result["stdout"]:
@@ -404,22 +453,42 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
             if sandbox_result["stderr"]:
                 test_note += f"\nErrors: {sandbox_result['stderr']}"
 
-            # If tests failed, auto-reject (no Reviewer call, save tokens)
+            # Auto-reject if tests failed (free reject, save a Reviewer call)
             if not sandbox_result["passed"] and sandbox_result["stderr"]:
                 print(f"  [Auto-reject] Tests failed")
-                synthetic_review = f"VERDICT: REJECT\n\nTests or compilation failed:\n{sandbox_result['stderr']}"
+                synthetic_review = f"VERDICT: REJECT\n\nTests failed — fix the implementation:\n{sandbox_result['stderr']}"
                 review = synthetic_review
+                security_review = None
             else:
-                # Tests passed or N/A; ask Reviewer
-                review_user = f"Task:\n{task}\n\nCoder's submission:\n{attempt}\n\n"
-                if written_files:
-                    review_user += f"Files written: {', '.join(f.name for f in written_files)}\n"
-                review_user += f"\nTest/compile results:\n{test_note}\n\nStart your reply with 'VERDICT: APPROVE' or 'VERDICT: REJECT' on its own line, then your reasoning."
-                print("  Reviewer is auditing...")
-                review = complete(client, budget, models["reviewer"], reviewer_persona, review_user, temperature=0.2)
+                # Tests passed; run Security check (once, after first pass)
+                security_review = None
+                if not security_passed:
+                    print("  Security is checking...")
+                    security_user = f"Task:\n{task}\n\nCode:\n{attempt}"
+                    try:
+                        security_review = complete(client, budget, models["security"], security_persona, security_user, temperature=0.2)
+                        security_verdict, _ = extract_verdict(security_review)
+                        if security_verdict == "REJECT":
+                            print(f"  [Security] Issues found")
+                            review = security_review
+                        else:
+                            security_passed = True
+                            review = None
+                    except RuntimeError as exc:
+                        print(f"[FAIL] Security check failed: {exc}")
+                        return 1
+                else:
+                    review = None
+
+                # Reviewer audits if Security passed
+                if review is None:
+                    print("  Reviewer is auditing...")
+                    review_user = f"Task:\n{task}\n\nAcceptance criteria:\n{criteria}\n\nCoder's submission:\n{attempt}\n\nTest results:\n{test_note}"
+                    review = complete(client, budget, models["reviewer"], reviewer_persona, review_user, temperature=0.2)
+
         except RuntimeError as exc:
             print(f"[FAIL] {exc}")
-            history.append({"round": str(round_no), "attempt": attempt, "review": f"(aborted by an API error before review completed)\n{exc}"})
+            history.append({"round": str(round_no), "attempt": attempt, "review": f"(error)\n{exc}"})
             _write_output(task, history, approved=False)
             return 1
 
@@ -433,23 +502,39 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
             return 0
 
         if verdict == "UNPARSEABLE":
-            # Retry once with context; don't count as a round burn
-            print("  Verdict line unclear; requesting clarification...")
-            retry_prompt = (
-                f"Task:\n{task}\n\nCoder's submission (excerpt):\n{attempt[:500]}\n\n"
-                f"Your previous response did not contain a parseable VERDICT: line.\n"
-                f"Please respond with EXACTLY this format:\nVERDICT: APPROVE\nor\nVERDICT: REJECT\n\nThen one sentence of reasoning."
-            )
+            print("  Verdict unclear; retrying...")
+            retry_prompt = f"Task:\n{task}\n\nCode:\n{attempt[:500]}\n\nPlease state: VERDICT: APPROVE or VERDICT: REJECT (one line only)."
             try:
                 review = complete(client, budget, models["reviewer"], reviewer_persona, retry_prompt, temperature=0.2)
                 verdict, reasoning = extract_verdict(review)
                 print(f"  Verdict (retry): {verdict}")
+                if verdict == "APPROVE":
+                    _write_output(task, history, approved=True)
+                    print(f"\n[OK] Approved after {round_no} round(s). Output written to swarm_output/.")
+                    return 0
             except RuntimeError:
-                # If retry fails, treat as REJECT and continue
                 verdict = "REJECT"
-                reasoning = "(retry failed; treating as REJECT)"
+                reasoning = "(retry failed)"
 
-        # Feed only the reasoning (without <think> blocks) as feedback, not the full review
+        # Deadlock check: if round 3 and still rejected, escalate to Arbiter
+        if round_no == max_rounds - 1 and verdict == "REJECT":
+            print("  Round 3 rejection; escalating to Arbiter...")
+            arbiter_user = f"Task:\n{task}\n\nCriteria:\n{criteria}\n\nRounds 1-3:\n"
+            for h in history[-3:]:
+                arbiter_user += f"\nAttempt {h['round']}:\n{h['attempt'][:300]}\nReviewer: {h['review'][:200]}\n"
+            arbiter_user += f"\nFinal attempt:\n{attempt[:500]}\n\nBreak the deadlock."
+            try:
+                arbiter_review = complete(client, budget, models["arbiter"], arbiter_persona, arbiter_user, temperature=0.2)
+                arbiter_verdict, arbiter_reasoning = extract_verdict(arbiter_review)
+                print(f"  Arbiter: {arbiter_verdict}")
+                history.append({"round": "arbiter", "attempt": attempt, "review": arbiter_review, "verdict": arbiter_verdict})
+                if arbiter_verdict == "APPROVE":
+                    _write_output(task, history, approved=True)
+                    print(f"\n[OK] Arbiter approved. Output written to swarm_output/.")
+                    return 0
+            except RuntimeError as exc:
+                print(f"Arbiter call failed: {exc}")
+
         feedback = reasoning
 
     _write_output(task, history, approved=False)
