@@ -26,6 +26,7 @@ task in Claude Code instead of spending more free-tier tokens on it.
 
 from __future__ import annotations
 
+import argparse
 import os
 import re
 import sys
@@ -38,6 +39,7 @@ from dotenv import load_dotenv
 from groq import Groq
 
 from agent_swarm_sandbox import sandbox_run
+from agent_swarm_context import load_repo_context
 
 # Windows terminals often default to cp1252, which can't encode the em-dashes
 # and other punctuation used in these messages. Force UTF-8 on stdout so
@@ -58,8 +60,8 @@ OUTPUT_DIR = ROOT / "swarm_output"
 # Run `python verify_key.py` after editing it.
 # ---------------------------------------------------------------------------
 MODEL_REGISTRY: dict[str, list[str]] = {
-    "orchestrator": ["openai/gpt-oss-20b"],
-    "coder": ["openai/gpt-oss-120b", "openai/gpt-oss-20b"],
+    "orchestrator": ["openai/gpt-oss-20b", "openai/gpt-oss-120b"],
+    "coder": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"],
     "reviewer": ["qwen/qwen3.6-27b", "groq/compound-mini"],
 }
 
@@ -239,25 +241,35 @@ def _fit_user_text(system: str, user: str, budget: TokenBudget) -> str:
 
 
 def complete(client: Groq, budget: TokenBudget, model: str, system: str, user: str, temperature: float) -> str:
+    """Call Groq with exponential backoff on 429/503."""
     user = _fit_user_text(system, user, budget)
     prompt_text = system + user
     max_tokens = budget.completion_cap(prompt_text)
-    budget.wait_if_needed(model, estimate_tokens(prompt_text) + max_tokens)
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
-    except groq.APIStatusError as exc:
-        raise RuntimeError(f"Groq API call to {model} failed ({exc.status_code}): {exc.message}") from exc
-    usage = resp.usage
-    budget.record(model, getattr(usage, "total_tokens", estimate_tokens(prompt_text) + max_tokens))
-    return resp.choices[0].message.content or ""
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        budget.wait_if_needed(model, estimate_tokens(prompt_text) + max_tokens)
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            )
+            usage = resp.usage
+            budget.record(model, getattr(usage, "total_tokens", estimate_tokens(prompt_text) + max_tokens))
+            return resp.choices[0].message.content or ""
+        except groq.APIStatusError as exc:
+            if exc.status_code in {429, 503} and attempt < max_retries - 1:
+                wait_time = 2 ** attempt  # 1s, 2s, 4s
+                print(f"  (rate limited; retrying in {wait_time}s...)")
+                time.sleep(wait_time)
+                continue
+            raise RuntimeError(f"Groq API call to {model} failed ({exc.status_code}): {exc.message}") from exc
+    raise RuntimeError(f"Groq API call to {model} failed after {max_retries} retries")
 
 
 def extract_verdict(review: str) -> tuple[str, str]:
@@ -328,7 +340,7 @@ def parse_and_write_files(coder_output: str, workspace_root: Path) -> list[Path]
     return written
 
 
-def run_swarm(task: str, max_rounds: int = MAX_ROUNDS) -> int:
+def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = None) -> int:
     api_key = os.environ.get("GROQ_API_KEY", "").strip()
     if not api_key:
         print("[FAIL] GROQ_API_KEY is not set. Copy .env.example to .env and paste your key in.")
@@ -344,9 +356,14 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS) -> int:
     coder_persona = load_persona("coder.md")
     reviewer_persona = load_persona("reviewer.md")
     budget = TokenBudget()
+    repo_context = load_repo_context(repo_path) if repo_path else None
 
     print(f"Coder    : {models['coder']}")
-    print(f"Reviewer : {models['reviewer']}\n")
+    print(f"Reviewer : {models['reviewer']}")
+    if repo_context:
+        print(f"Repo     : {repo_path}\n")
+    else:
+        print()
 
     feedback = ""
     attempt = ""
@@ -355,7 +372,10 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS) -> int:
 
     for round_no in range(1, max_rounds + 1):
         print(f"--- round {round_no} ---")
-        coder_user = f"Task:\n{task}"
+        coder_user = ""
+        if repo_context and round_no == 1:
+            coder_user += f"You are working in this repository:\n{repo_context}\n\n"
+        coder_user += f"Task:\n{task}"
         if feedback:
             coder_user += f"\n\nThe reviewer rejected your last attempt. Their feedback:\n{feedback}\n\nRevise accordingly."
 
@@ -448,7 +468,9 @@ def _write_output(task: str, history: list[dict[str, str]], approved: bool) -> P
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print('Usage: python agent_swarm.py "task description"')
-        sys.exit(1)
-    sys.exit(run_swarm(" ".join(sys.argv[1:])))
+    parser = argparse.ArgumentParser(description="Coder/Reviewer swarm on Groq free tier")
+    parser.add_argument("task", help="Task description")
+    parser.add_argument("--repo", help="Optional: path to repo for context injection", default=None)
+    args = parser.parse_args()
+
+    sys.exit(run_swarm(args.task, repo_path=args.repo))
