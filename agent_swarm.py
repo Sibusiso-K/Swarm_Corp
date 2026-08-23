@@ -233,19 +233,41 @@ def _find_truncation_point(text: str, max_chars: int) -> int:
     return safe_zone
 
 
+ELISION_MARKER = "\n\n[... middle truncated for budget ...]\n\n"
+
+
 def _fit_user_text(system: str, user: str, budget: TokenBudget) -> str:
     """If system + user + the minimum floor completion would already blow
     the per-request cap, truncate user (the variable-length part — usually
-    feedback + prior attempt) intelligently rather than let the request 413.
-    Truncates in the middle at a good break point, not the tail."""
+    criteria/tests + task + feedback) rather than let the request 413.
+
+    Cuts the MIDDLE, keeping a head chunk and a tail chunk: the task and the
+    Reviewer/Arbiter's feedback live at the end of the prompt (see run_swarm),
+    so a tail-only cut silently drops the one thing the Coder most needs to
+    act on. The head still carries enough context (criteria/tests) to be
+    useful, and the elision marker is only emitted when something was
+    actually removed."""
     floor = 3500  # must match completion_cap's cap so truncation reserves enough room
     available_for_user = (budget.limit_per_request - floor) - estimate_tokens(system)
     available_chars = max(0, available_for_user * 3)  # inverse of estimate_tokens' ceil(len/3)
     if len(user) <= available_chars:
         return user
-    # Truncate at a sensible break point, keeping the end (revision intent)
-    break_point = _find_truncation_point(user, available_chars)
-    return user[:break_point] + "\n\n[... previous rounds' full code truncated for budget; revised diff below ...]"
+
+    marker_chars = len(ELISION_MARKER)
+    budget_for_content = max(0, available_chars - marker_chars)
+    head_chars = budget_for_content // 2
+    tail_chars = budget_for_content - head_chars
+
+    head_point = _find_truncation_point(user, head_chars)
+    head = user[:head_point]
+    # For the tail, find a break point within the last tail_chars of the text.
+    tail_start = max(head_point, len(user) - tail_chars)
+    next_break = user.find("\n", tail_start)
+    if next_break != -1 and next_break < len(user) - 1:
+        tail_start = next_break + 1
+    tail = user[tail_start:]
+
+    return head + ELISION_MARKER + tail
 
 
 def complete(client: Groq, budget: TokenBudget, model: str, system: str, user: str, temperature: float) -> str:
