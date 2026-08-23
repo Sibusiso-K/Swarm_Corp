@@ -60,7 +60,6 @@ OUTPUT_DIR = ROOT / "swarm_output"
 # Run `python verify_key.py` after editing it.
 # ---------------------------------------------------------------------------
 MODEL_REGISTRY: dict[str, list[str]] = {
-    "orchestrator": ["openai/gpt-oss-20b", "openai/gpt-oss-120b"],
     "coder": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"],
     "reviewer": ["qwen/qwen3.6-27b", "groq/compound-mini"],
 }
@@ -154,13 +153,12 @@ class TokenBudget:
 
     def completion_cap(self, prompt_text: str) -> int:
         """Max completion tokens we can ask for without blowing the
-        per-request cap. Floored at 512, not 256: gpt-oss-family models are
-        reasoning models that spend part of max_tokens on hidden reasoning
-        before any visible content, so a tighter floor risks a response
-        that's entirely reasoning tokens and no answer. We leave room for the
-        actual usage reported back to be higher than our estimate."""
+        per-request cap. Floored at 512 (reasoning models need headroom for
+        hidden <think> tokens before visible output). Capped at 2000 so
+        multiple calls can fit in the per-model 60s window (~1500 actual tokens
+        per call means 3–4 calls/min instead of throttled to 1/min)."""
         remaining = self.limit_per_request - estimate_tokens(prompt_text)
-        return max(512, remaining)
+        return max(512, min(remaining, 2000))
 
     def record(self, model: str, tokens_used: int) -> None:
         now = time.time()

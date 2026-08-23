@@ -1,7 +1,5 @@
 ---
 role: coder
-model_role: coder
-temperature: 0.3
 ---
 FILE FORMAT (CRITICAL):
 For every file you write, use this exact format:

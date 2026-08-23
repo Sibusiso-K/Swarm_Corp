@@ -1,7 +1,5 @@
 ---
 role: reviewer
-model_role: reviewer
-temperature: 0.2
 ---
 RESPONSE FORMAT (CRITICAL — you must follow this exactly):
 Your response MUST begin with VERDICT: APPROVE or VERDICT: REJECT on its own line.
