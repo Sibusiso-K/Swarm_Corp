@@ -165,11 +165,10 @@ class TokenBudget:
     def completion_cap(self, prompt_text: str) -> int:
         """Max completion tokens we can ask for without blowing the
         per-request cap. Floored at 512 (reasoning models need headroom for
-        hidden <think> tokens before visible output). Capped at 2000 so
-        multiple calls can fit in the per-model 60s window (~1500 actual tokens
-        per call means 3–4 calls/min instead of throttled to 1/min)."""
+        hidden <think> tokens before visible output). Capped at 3500 so
+        gpt-oss-120b has room to emit full implementations without truncation."""
         remaining = self.limit_per_request - estimate_tokens(prompt_text)
-        return max(512, min(remaining, 2000))
+        return max(512, min(remaining, 3500))
 
     def record(self, model: str, tokens_used: int) -> None:
         now = time.time()
@@ -327,8 +326,11 @@ def parse_and_write_files(coder_output: str, workspace_root: Path, allow_tests: 
     other caller (i.e. the Coder) is refused there, so the independently
     authored tests can't be overwritten by the code they're meant to judge.
 
+    Strips accidental markdown code fences (```lang / ```) as a hard backstop.
+
     Returns list of written file paths. Raises if the writer tries to break out
-    of workspace_root (e.g., uses ../ in paths)."""
+    of workspace_root (e.g., uses ../ in paths). Does NOT roll back on error —
+    files written before an error are kept."""
     workspace_root.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
 
@@ -341,6 +343,10 @@ def parse_and_write_files(coder_output: str, workspace_root: Path, allow_tests: 
             break
         file_path_str = parts[i].strip()
         content = parts[i + 1]
+
+        # Strip accidental markdown fences (backstop against fence-wrapped output)
+        content = re.sub(r"^```\w*\n", "", content)  # opening fence
+        content = re.sub(r"\n```$", "", content)  # closing fence
 
         # Security: reject paths that try to escape or overwrite tests
         if ".." in file_path_str or file_path_str.startswith("/"):
@@ -469,9 +475,11 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
                 test_note += f"\nErrors: {sandbox_result['stderr']}"
 
             # Auto-reject if tests failed (free reject, save a Reviewer call)
-            if not sandbox_result["passed"] and sandbox_result["stderr"]:
+            # pytest reports failures on stdout, not stderr, so check both
+            if not sandbox_result["passed"] and (sandbox_result["stderr"] or sandbox_result["stdout"]):
                 print(f"  [Auto-reject] Tests failed")
-                synthetic_review = f"VERDICT: REJECT\n\nTests failed — fix the implementation:\n{sandbox_result['stderr']}"
+                output = sandbox_result["stderr"] or sandbox_result["stdout"]
+                synthetic_review = f"VERDICT: REJECT\n\nTests failed — fix the implementation:\n{output}"
                 review = synthetic_review
                 security_review = None
             else:

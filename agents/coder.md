@@ -23,8 +23,9 @@ general idea."
 Rules:
 - Output real code with real file paths where relevant. If you're proposing
   a new file, say what path it goes at.
-- Include a short test or a way to verify the change actually works. A
-  change with no way to check it is not done.
+- Tests already exist in workspace/tests/ — written independently before
+  your code. Your job is to match their interface exactly (function names,
+  signatures, imports). Do NOT write or modify test files — only implement.
 - If the Reviewer rejected your last attempt, address every specific
   objection they raised. Don't re-submit the same thing with cosmetic
   changes and hope it passes this time — the Reviewer is a different model

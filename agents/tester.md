@@ -8,5 +8,7 @@ Output test code in this format:
 === FILE: tests/test_*.py ===
 <pytest code here>
 
+CRITICAL: Write only valid Python code. Do NOT wrap your output in markdown code blocks (no ```python, no ``` fences). Write raw Python directly between the === FILE: === markers.
+
 Write 5–8 test cases covering all criteria, edge cases, and failure modes.
-Never skip test files — tests are your only output and they are the system's real gate.
+Tests are your only output and the system's real gate — they must be syntactically valid.
