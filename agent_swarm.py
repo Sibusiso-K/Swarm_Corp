@@ -238,7 +238,7 @@ def _fit_user_text(system: str, user: str, budget: TokenBudget) -> str:
     the per-request cap, truncate user (the variable-length part — usually
     feedback + prior attempt) intelligently rather than let the request 413.
     Truncates in the middle at a good break point, not the tail."""
-    floor = 2000  # match completion_cap's target; reasoning models need headroom
+    floor = 3500  # must match completion_cap's cap so truncation reserves enough room
     available_for_user = (budget.limit_per_request - floor) - estimate_tokens(system)
     available_chars = max(0, available_for_user * 3)  # inverse of estimate_tokens' ceil(len/3)
     if len(user) <= available_chars:
@@ -483,19 +483,17 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
                 output = sandbox_result["stderr"] or sandbox_result["stdout"]
                 synthetic_review = f"VERDICT: REJECT\n\nTests failed — fix the implementation:\n{output}"
                 review = synthetic_review
-                security_review = None
             else:
                 # Tests passed; run Security check (once, after first pass)
-                security_review = None
                 if not security_passed:
                     print("  Security is checking...")
                     security_user = f"Task:\n{task}\n\nCode:\n{attempt}"
                     try:
-                        security_review = complete(client, budget, models["security"], security_persona, security_user, temperature=0.2)
-                        security_verdict, _ = extract_verdict(security_review)
+                        security_output = complete(client, budget, models["security"], security_persona, security_user, temperature=0.2)
+                        security_verdict, _ = extract_verdict(security_output)
                         if security_verdict == "REJECT":
                             print(f"  [Security] Issues found")
-                            review = security_review
+                            review = security_output
                         else:
                             security_passed = True
                             review = None
@@ -557,6 +555,8 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
                     _write_output(task, history, approved=True)
                     print(f"\n[OK] Arbiter approved. Output written to swarm_output/.")
                     return 0
+                # Feed Arbiter's specific instruction, not the Reviewer's
+                reasoning = arbiter_reasoning
             except RuntimeError as exc:
                 print(f"Arbiter call failed: {exc}")
 
