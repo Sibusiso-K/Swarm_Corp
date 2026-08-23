@@ -344,9 +344,11 @@ def parse_and_write_files(coder_output: str, workspace_root: Path, allow_tests: 
         file_path_str = parts[i].strip()
         content = parts[i + 1]
 
-        # Strip accidental markdown fences (backstop against fence-wrapped output)
-        content = re.sub(r"^```\w*\n", "", content)  # opening fence
-        content = re.sub(r"\n```$", "", content)  # closing fence
+        # Strip accidental markdown fences (backstop against fence-wrapped
+        # output). re.split leaves the newline that followed the marker line,
+        # so content starts with "\n" — the leading \s* is load-bearing.
+        content = re.sub(r"^\s*```[\w+-]*[ \t]*\n", "", content)
+        content = re.sub(r"\n```[ \t]*\s*$", "\n", content)
 
         # Security: reject paths that try to escape or overwrite tests
         if ".." in file_path_str or file_path_str.startswith("/"):
