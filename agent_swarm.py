@@ -320,11 +320,15 @@ def extract_verdict(review: str) -> tuple[str, str]:
 
 
 
-def parse_and_write_files(coder_output: str, workspace_root: Path) -> list[Path]:
-    """Parse Coder output for `=== FILE: path ===` blocks and write them.
+def parse_and_write_files(coder_output: str, workspace_root: Path, allow_tests: bool = False) -> list[Path]:
+    """Parse `=== FILE: path ===` blocks and write them.
 
-    Returns list of written file paths. Raises if Coder tries to break out of
-    workspace_root (e.g., uses ../ in paths)."""
+    allow_tests=True is for the Tester, which owns the tests/ subtree. Every
+    other caller (i.e. the Coder) is refused there, so the independently
+    authored tests can't be overwritten by the code they're meant to judge.
+
+    Returns list of written file paths. Raises if the writer tries to break out
+    of workspace_root (e.g., uses ../ in paths)."""
     workspace_root.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
 
@@ -341,7 +345,7 @@ def parse_and_write_files(coder_output: str, workspace_root: Path) -> list[Path]
         # Security: reject paths that try to escape or overwrite tests
         if ".." in file_path_str or file_path_str.startswith("/"):
             raise RuntimeError(f"Unsafe file path: {file_path_str}")
-        if file_path_str.startswith("tests/") or file_path_str.startswith("tests\\"):
+        if not allow_tests and (file_path_str.startswith("tests/") or file_path_str.startswith("tests\\")):
             raise RuntimeError(f"Coder cannot write to tests/: {file_path_str}. Tester writes all tests.")
 
         file_path = workspace_root / file_path_str
@@ -408,8 +412,11 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
         tester_user = f"Acceptance criteria:\n{criteria}\n\nWrite tests based on these criteria, not implementation."
         tests_output = complete(client, budget, models["tester"], tester_persona, tester_user, temperature=0.3)
         try:
-            parse_and_write_files(tests_output, workspace_root)
-            print("  Tests written to workspace/tests/")
+            test_files = parse_and_write_files(tests_output, workspace_root, allow_tests=True)
+            if not test_files:
+                print("[FAIL] Tester produced no test files (bad === FILE: === format).")
+                return 1
+            print(f"  Wrote {len(test_files)} test file(s)")
         except RuntimeError as exc:
             print(f"[FAIL] Tester output invalid: {exc}")
             return 1
@@ -425,7 +432,15 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
 
     for round_no in range(1, max_rounds + 1):
         print(f"--- round {round_no} ---")
-        coder_user = f"Acceptance criteria:\n{criteria}\n\nTask:\n{task}"
+        # The Coder sees the tests so it matches their import surface and
+        # function signatures. Independence comes from the tests being written
+        # before/blind to the implementation, not from hiding them.
+        coder_user = (
+            f"Acceptance criteria:\n{criteria}\n\n"
+            f"These tests were written independently and WILL be run against your code. "
+            f"Match their imports and signatures exactly. Do not rewrite them:\n{tests_output}\n\n"
+            f"Task:\n{task}"
+        )
         if repo_context and round_no == 1:
             coder_user = f"Repository:\n{repo_context}\n\n" + coder_user
         if feedback:
