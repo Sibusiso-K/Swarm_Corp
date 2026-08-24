@@ -12,9 +12,9 @@ That's it. There is no Kilo Code, no jcode, no other harness or IDE
 extension in this project's design. If you find a doc or comment implying
 otherwise, it's stale — fix it to match this file.
 
-## The 6 roles
+## The 7 roles
 
-Planner → Tester → **[** Coder ⇄ Sandbox ⇄ Security/Reviewer **]** → Arbiter
+Planner → Tester → **[** Coder ⇄ Sandbox ⇄ Security/Architect/Reviewer **]** → Arbiter
 
 - **Planner** writes acceptance criteria from the task.
 - **Tester** writes tests against those criteria *before* seeing any
@@ -26,6 +26,11 @@ Planner → Tester → **[** Coder ⇄ Sandbox ⇄ Security/Reviewer **]** → A
   (never a bare `"python"` string — that resolves to system Python, not the
   venv, and silently never runs anything).
 - **Security** audits once, after the first round that passes tests.
+- **Architect** audits structure (coupling, duplication, layering) once,
+  alongside Security, and writes `ARCHITECTURE.md`. Deliberately **not** a
+  gate — its REJECT doesn't block approval and a failed call doesn't abort
+  the run. Adding another blocking role would add another deadlock surface;
+  the structural read is worth having as a record, not as a veto.
 - **Reviewer** — a different model *family* than the Coder, enforced at
   startup — audits the implementation.
 - **Arbiter** breaks a round-3 deadlock, and sees the same test evidence
@@ -91,24 +96,41 @@ demonstrated it's stuck.
 
 ```
 Swarm_Corp/
-├── swarm_corp.py         # the whole orchestration loop, all 6 roles
+├── swarm_corp.py         # the whole orchestration loop, all 7 roles
 ├── providers.py          # multi-provider client abstraction
 ├── sandbox.py            # runs Coder output for evidence-based verdicts
+├── tools.py              # file/web/git access — free reads vs gated writes
+├── gates.py              # human-only approval + audit log
+├── redact.py             # strips secrets before anything enters a prompt
+├── ui.py                 # Rich live streaming terminal (--plain to disable)
 ├── context.py            # --repo file-tree/sample loader
 ├── verify_key.py         # run this first, and any time something breaks
-├── agents/
-│   ├── planner.md
-│   ├── tester.md
-│   ├── coder.md
-│   ├── security.md
-│   ├── reviewer.md
-│   └── arbiter.md
+├── agents/               # 7 personas: planner, tester, coder, security,
+│                         #   architect, reviewer, arbiter
+├── templates/            # --template <name>: domain hints for the Planner
+├── bench/                # prompt-strategy (zero/one/few-shot) comparison
 ├── RUBRIC.md              # loaded into the Reviewer's prompt at runtime
 ├── requirements.txt
 ├── .env.example           # copy to .env, paste provider keys in
 ├── Start Swarm_Corp.bat   # Desktop-launcher entry point
-└── swarm_output/          # every run's transcript + code (gitignored)
+└── swarm_output/          # per run: code + transcript .md + metrics .json
+                           #   (gitignored)
 ```
+
+## Security model, and its one deliberate exception
+
+`tools.py` splits access into free reads (path-confined, secret-redacted)
+and gated side effects (`gates.py`, human keystroke only — no model output
+can satisfy a gate). Fetched web content is wrapped in explicit data
+delimiters so a page saying "ignore previous instructions" is inert.
+
+The **one** ungated write outside the workspace is the `--repo` memory log
+(`<repo>/.swarm_corp_memory.md`). That rule exists to stop a *model* writing
+arbitrary content to an arbitrary path; this write is a fixed filename, a
+fixed one-line format, and content authored by the harness (timestamp +
+status + the user's own task string). Gating it would mean an approval
+prompt on every `--repo` run. Documented here so it isn't a silent
+inconsistency.
 
 ## Architecture note
 

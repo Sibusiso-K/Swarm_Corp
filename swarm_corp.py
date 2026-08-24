@@ -715,6 +715,16 @@ def _run_pipeline(
         md_path = _write_transcript(task, history, approved)
         _write_metrics(md_path, task, approved, history, budget, models, time.time() - start_time)
         if memory_path:
+            # DELIBERATE CARVE-OUT from the "writes outside the workspace are
+            # gated" rule in tools.py/gates.py. That rule exists to stop a
+            # MODEL writing arbitrary content to an arbitrary path. This
+            # write is none of those things: fixed filename, fixed one-line
+            # format, content authored by the harness (a timestamp, a status,
+            # and the task string the user themselves typed) — no model output
+            # reaches it. Gating it would mean an approval prompt on every
+            # single --repo run for a log line the user asked for by passing
+            # --repo at all. Stated here rather than left as a silent
+            # inconsistency in the security model.
             status = "APPROVED" if approved else "ESCALATED"
             entry = f"- {datetime.now().strftime('%Y-%m-%d %H:%M')} [{status}] {task}\n"
             with open(memory_path, "a", encoding="utf-8") as f:
