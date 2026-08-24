@@ -651,6 +651,7 @@ def run_swarm(
     repo_path: str | None = None,
     private: bool = False,
     template: str | None = None,
+    allowed_domains: set[str] | None = None,
 ) -> int:
     if private:
         from providers import ollama_is_running
@@ -671,7 +672,7 @@ def run_swarm(
         ui.note("  NOTE: one local model means Coder and Reviewer share a family.")
         ui.note("  The cross-family review guarantee does NOT hold in this mode.")
         models = {role: PRIVATE_MODEL for role in MODEL_REGISTRY}
-        return _run_pipeline(task, models, max_rounds, repo_path, private=True, template=template)
+        return _run_pipeline(task, models, max_rounds, repo_path, private=True, template=template, allowed_domains=allowed_domains)
 
     providers = available_providers()
     if not providers:
@@ -688,7 +689,7 @@ def run_swarm(
         print(f"[FAIL] {exc}")
         return 1
 
-    return _run_pipeline(task, models, max_rounds, repo_path, private=False, template=template)
+    return _run_pipeline(task, models, max_rounds, repo_path, private=False, template=template, allowed_domains=allowed_domains)
 
 
 def _run_pipeline(
@@ -698,6 +699,7 @@ def _run_pipeline(
     repo_path: str | None,
     private: bool,
     template: str | None = None,
+    allowed_domains: set[str] | None = None,
 ) -> int:
     """The Planner->Tester->Coder<->Sandbox<->Review->Arbiter pipeline,
     shared by the normal multi-provider path and --private (where `models`
@@ -764,7 +766,7 @@ def _run_pipeline(
     tool_roots = [workspace_root]
     if repo_path:
         tool_roots.append(Path(repo_path).resolve())
-    tools.configure(allowed_roots=tool_roots)
+    tools.configure(allowed_roots=tool_roots, allowed_domains=allowed_domains)
     if private:
         tools.disable_network()
 
@@ -1107,6 +1109,16 @@ if __name__ == "__main__":
             "'langgraph_agent'). See the templates/ directory for the full list."
         ),
     )
+    parser.add_argument(
+        "--allow-domains",
+        default="",
+        help=(
+            "Comma-separated domains the Coder's http_get tool may fetch "
+            "(e.g. 'docs.python.org,pypi.org'). Empty means NO network "
+            "fetches — default deny. Internal/loopback hosts are blocked "
+            "even when allowlisted."
+        ),
+    )
     args = parser.parse_args()
 
     gates.configure(
@@ -1115,4 +1127,5 @@ if __name__ == "__main__":
     )
 
     ui.init(plain=args.plain)
-    sys.exit(run_swarm(args.task, repo_path=args.repo, private=args.private, template=args.template))
+    sys.exit(run_swarm(args.task, repo_path=args.repo, private=args.private, template=args.template,
+                        allowed_domains={d.strip() for d in args.allow_domains.split(',') if d.strip()}))

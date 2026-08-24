@@ -38,6 +38,7 @@ python swarm_corp.py "add a /health endpoint with a test"
 | `--plain` | Disable the Rich live UI (for CI/piping) |
 | `--dry-run` | Never execute a gated side effect; log what would have run |
 | `--allow CATS` | Pre-approve gate categories, comma-separated |
+| `--allow-domains D` | Domains the Coder may `http_get`. **Empty = no fetches at all** (default deny) |
 
 ## What happens
 

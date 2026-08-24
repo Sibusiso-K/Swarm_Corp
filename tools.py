@@ -170,13 +170,52 @@ def _git_readonly(repo_path: str, args: list[str]) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
 
 
+def _host_is_internal(host: str) -> bool:
+    """True for loopback / link-local / private-range / .internal hosts.
+
+    http_get is auto-dispatchable by the Coder with no human in the loop, so
+    an allowlisted-but-internal target (or a public name that resolves to a
+    private IP) is the classic SSRF path — cloud metadata endpoints, local
+    admin panels, other services on the machine. Blocked regardless of the
+    allowlist.
+    """
+    import ipaddress
+    import socket
+
+    if not host:
+        return True
+    if host.lower() in {"localhost"} or host.lower().endswith((".local", ".internal")):
+        return True
+    try:
+        # Resolve first: an allowlisted public name can still point at a
+        # private address, so checking the literal string is not enough.
+        for info in socket.getaddrinfo(host, None):
+            ip = ipaddress.ip_address(info[4][0])
+            if ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_reserved:
+                return True
+    except (socket.gaierror, ValueError):
+        return True  # unresolvable: fail closed
+    return False
+
+
 def http_get(url: str, timeout_sec: int = 10) -> dict[str, Any]:
     if NETWORK_DISABLED:
         return {"ok": False, "error": "network access disabled (--private mode)"}
     from urllib.parse import urlparse
-    host = urlparse(url).hostname or ""
-    if ALLOWED_DOMAINS and not any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS):
-        return {"ok": False, "error": f"domain '{host}' not in allowlist {ALLOWED_DOMAINS}"}
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return {"ok": False, "error": f"unsupported scheme '{parsed.scheme}' (http/https only)"}
+    host = parsed.hostname or ""
+    # DEFAULT DENY. An empty allowlist previously meant "no restriction",
+    # which made every normal run able to fetch any URL on the internet
+    # unattended (tools.configure() is called without allowed_domains). It
+    # now means "nothing allowed" — opt in with --allow-domains.
+    if not ALLOWED_DOMAINS:
+        return {"ok": False, "error": "no domains allowlisted; pass --allow-domains example.com,docs.python.org"}
+    if not any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS):
+        return {"ok": False, "error": f"domain '{host}' not in allowlist {sorted(ALLOWED_DOMAINS)}"}
+    if _host_is_internal(host):
+        return {"ok": False, "error": f"host '{host}' resolves to an internal/loopback address — blocked"}
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Swarm_Corp/1.0"})
         with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
@@ -229,6 +268,12 @@ def http_write(url: str, method: str, body: str = "") -> dict[str, Any]:
         return {"ok": False, "error": "network access disabled (--private mode)"}
     if method.upper() not in {"POST", "PUT", "DELETE", "PATCH"}:
         return {"ok": False, "error": f"unsupported method: {method}"}
+    # Same SSRF guard as http_get. This one is also gated, but a human
+    # approving "POST https://internal-admin/..." shouldn't be the only
+    # thing standing between the swarm and a loopback service.
+    from urllib.parse import urlparse
+    if _host_is_internal(urlparse(url).hostname or ""):
+        return {"ok": False, "error": "host resolves to an internal/loopback address — blocked"}
     if not approve("network_write", f"{method.upper()} {url} (body: {len(body)} chars)"):
         return {"ok": False, "error": "not approved"}
     try:
