@@ -120,6 +120,14 @@ MODEL_REGISTRY: dict[str, list[str]] = {
         "groq:groq/compound",
         "groq:groq/compound-mini",
     ],
+    # Phase 6: structural audit, informational only — not a gate. Prefers
+    # a strong reasoner distinct from Coder's family where possible.
+    "architect": [
+        "cohere:c4ai-aya-expanse-32b",
+        "huggingface:deepseek-ai/DeepSeek-V4-Flash-0731",
+        "gemini:gemini-pro-latest",
+        "groq:groq/compound",
+    ],
 }
 
 # Phase 5: every role runs on the local model in --private mode. Family
@@ -682,6 +690,7 @@ def _run_pipeline(
     tester_persona = load_persona("tester.md")
     security_persona = load_persona("security.md")
     arbiter_persona = load_persona("arbiter.md")
+    architect_persona = load_persona("architect.md")
 
     rubric_path = ROOT / "RUBRIC.md"
     if rubric_path.exists():
@@ -717,6 +726,7 @@ def _run_pipeline(
     ui.note(f"Security : {models['security']}")
     ui.note(f"Reviewer : {models['reviewer']}")
     ui.note(f"Arbiter  : {models['arbiter']}")
+    ui.note(f"Architect: {models['architect']}")
     if repo_context:
         ui.note(f"Repo     : {repo_path}\n")
     else:
@@ -756,6 +766,7 @@ def _run_pipeline(
     feedback = ""
     attempt = ""
     security_passed = False
+    architect_ran = False
     tool_rounds_used = 0
     history: list[dict[str, str]] = []
 
@@ -844,6 +855,21 @@ def _run_pipeline(
                     except RuntimeError as exc:
                         print(f"[FAIL] Security check failed: {exc}")
                         return 1
+
+                    # Architect audits once, alongside Security — informational
+                    # only, never blocks approval. A failure here shouldn't
+                    # abort a run that has otherwise passed tests and security.
+                    if security_passed and not architect_ran:
+                        architect_ran = True
+                        try:
+                            ui.start_role("Architect", models["architect"])
+                            architect_user = f"Task:\n{task}\n\nCode:\n{attempt}"
+                            architect_output = complete(budget, models["architect"], architect_persona, architect_user, temperature=0.2, on_chunk=ui.stream_chunk)
+                            ui.end_role()
+                            (workspace_root / "ARCHITECTURE.md").write_text(architect_output, encoding="utf-8")
+                            ui.status("  [Architect] Wrote ARCHITECTURE.md")
+                        except RuntimeError as exc:
+                            ui.status(f"  [Architect] Skipped (call failed: {exc})")
                 else:
                     review = None
 
