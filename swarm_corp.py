@@ -29,6 +29,7 @@ task in Claude Code instead of spending more free-tier tokens on it.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -280,6 +281,12 @@ class TokenBudget:
 
     def __init__(self):
         self._windows: dict[str, list[tuple[float, int]]] = {}  # ref -> [(timestamp, tokens)]
+        # _windows is pruned to a rolling 60s window on every call (that's
+        # its whole job — TPM rate limiting), so it can't answer "how many
+        # tokens did this run cost in total". This is a separate, never-
+        # pruned accumulator for exactly that question, used by Phase 7's
+        # observability metrics.
+        self._lifetime: dict[str, int] = {}
 
     def _limit_for(self, ref: str) -> int:
         provider, _ = split_ref(ref)
@@ -303,6 +310,12 @@ class TokenBudget:
             self._windows[ref] = []
         self._windows[ref] = [(t, n) for t, n in self._windows[ref] if now - t < TPM_WINDOW_SECONDS]
         self._windows[ref].append((now, tokens_used))
+        self._lifetime[ref] = self._lifetime.get(ref, 0) + tokens_used
+
+    def lifetime_summary(self) -> dict[str, int]:
+        """Total tokens spent per ref across this TokenBudget's whole
+        lifetime (i.e. the whole run — one TokenBudget per run)."""
+        return dict(self._lifetime)
 
     def wait_if_needed(self, ref: str, upcoming_tokens: int) -> None:
         now = time.time()
@@ -690,6 +703,24 @@ def _run_pipeline(
     shared by the normal multi-provider path and --private (where `models`
     is every role pointed at the one local Ollama model instead of
     resolve_models()'s per-role picks)."""
+    start_time = time.time()
+
+    def _write_output(task: str, history: list[dict[str, str]], approved: bool) -> Path:
+        # Shadows the module-level _write_output for the rest of this
+        # function: same signature, same 5 call sites below unchanged, but
+        # now also emits the Phase 7 metrics JSON alongside the transcript.
+        # `budget` is assigned further down but resolves fine here — Python
+        # looks up a closure's free variables at CALL time, not def time,
+        # and every call to this happens after budget exists.
+        md_path = _write_transcript(task, history, approved)
+        _write_metrics(md_path, task, approved, history, budget, models, time.time() - start_time)
+        if memory_path:
+            status = "APPROVED" if approved else "ESCALATED"
+            entry = f"- {datetime.now().strftime('%Y-%m-%d %H:%M')} [{status}] {task}\n"
+            with open(memory_path, "a", encoding="utf-8") as f:
+                f.write(entry)
+        return md_path
+
     # Load all personas
     coder_persona = load_persona("coder.md")
     reviewer_persona = load_persona("reviewer.md")
@@ -739,9 +770,23 @@ def _run_pipeline(
     else:
         ui.note("")
 
+    # Phase 7: cross-run memory. Only when --repo is given — a memory file
+    # scoped to "this project" makes sense; one scoped to nowhere in
+    # particular doesn't. Mechanical log (task + outcome + timestamp), not
+    # LLM-summarized: an extra completion call per run just to write a
+    # memory entry would cost more than the memory is worth, and a plain
+    # log is easier to trust than a model's own account of what it did.
+    memory_path = Path(repo_path).resolve() / ".swarm_corp_memory.md" if repo_path else None
+    memory_context = ""
+    if memory_path and memory_path.exists():
+        memory_context = memory_path.read_text(encoding="utf-8")[-4000:]  # most recent entries
+
     # Phase 1: Planner writes acceptance criteria
     ui.status("--- planning ---")
     planner_user = f"Task:\n{task}"
+    if memory_context:
+        planner_user = f"Prior work on this project:\n{memory_context}\n\n{planner_user}"
+        ui.note(f"Memory   : {memory_path}")
     if template:
         template_path = ROOT / "templates" / f"{template}.md"
         if template_path.exists():
@@ -977,7 +1022,27 @@ def _run_pipeline(
     return 1
 
 
-def _write_output(task: str, history: list[dict[str, str]], approved: bool) -> Path:
+def _write_metrics(md_path: Path, task: str, approved: bool, history: list[dict], budget: "TokenBudget", models: dict[str, str], wall_clock_sec: float) -> Path:
+    """Phase 7 observability: what did this run actually cost, on which
+    models, and how long did it take. Sits alongside the .md transcript
+    (same stem, .json extension) rather than replacing it — the transcript
+    is for reading, this is for querying/aggregating across runs."""
+    json_path = md_path.with_suffix(".json")
+    tokens_by_model = budget.lifetime_summary()
+    record = {
+        "task": task,
+        "approved": approved,
+        "rounds": len(history),
+        "wall_clock_sec": round(wall_clock_sec, 1),
+        "models_used": models,
+        "tokens_by_model": tokens_by_model,
+        "total_tokens": sum(tokens_by_model.values()),
+    }
+    json_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    return json_path
+
+
+def _write_transcript(task: str, history: list[dict[str, str]], approved: bool) -> Path:
     OUTPUT_DIR.mkdir(exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     status = "approved" if approved else "escalate"
