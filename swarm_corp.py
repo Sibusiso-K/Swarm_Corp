@@ -117,6 +117,11 @@ MODEL_REGISTRY: dict[str, list[str]] = {
 }
 
 MAX_ROUNDS = 4  # coder attempts before we punt to Claude Code
+# Cap on info-gathering rounds. Without this the Coder can spend every one
+# of MAX_ROUNDS asking for tools and never submit code — the run then
+# "fails" having produced nothing, which looks like a model failure but is
+# really the harness letting itself be starved.
+MAX_TOOL_ROUNDS = 2
 TPM_WINDOW_SECONDS = 60
 
 
@@ -699,6 +704,7 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
     feedback = ""
     attempt = ""
     security_passed = False
+    tool_rounds_used = 0
     history: list[dict[str, str]] = []
 
     for round_no in range(1, max_rounds + 1):
@@ -729,10 +735,18 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
             # tradeoff for keeping tool calls bounded (see run_tool_request's
             # docstring) rather than letting a round's token cost be
             # open-ended.
-            tool_feedback = run_tool_request(attempt)
+            tool_feedback = run_tool_request(attempt) if tool_rounds_used < MAX_TOOL_ROUNDS else None
             if tool_feedback is not None:
-                ui.status(f"  Tool request handled (round used for info-gathering, not a submission)")
-                feedback = tool_feedback
+                tool_rounds_used += 1
+                remaining = MAX_TOOL_ROUNDS - tool_rounds_used
+                ui.status(f"  Tool request handled (info-gathering round; {remaining} tool round(s) left)")
+                feedback = (
+                    f"{tool_feedback}\n\n"
+                    f"You have {remaining} tool request(s) remaining. "
+                    f"Write the implementation now unless you genuinely cannot proceed."
+                    if remaining == 0
+                    else f"{tool_feedback}\n\nYou have {remaining} tool request(s) remaining."
+                )
                 history.append({"round": str(round_no), "attempt": attempt, "review": f"(tool round)\n{tool_feedback}", "verdict": "TOOL"})
                 continue
 
@@ -892,7 +906,26 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable the Rich live UI (plain print()-per-line output; use for CI or piping).",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Never execute a gated side effect; log what would have run instead.",
+    )
+    parser.add_argument(
+        "--allow",
+        default="",
+        help=(
+            "Comma-separated gate categories to pre-approve for this run "
+            "(e.g. 'git_commit,write_outside_workspace'). Set before the run "
+            "by you — nothing a model emits can add to this."
+        ),
+    )
     args = parser.parse_args()
+
+    gates.configure(
+        dry_run=args.dry_run,
+        pre_allow={c.strip() for c in args.allow.split(",") if c.strip()},
+    )
 
     ui.init(plain=args.plain)
     sys.exit(run_swarm(args.task, repo_path=args.repo))
