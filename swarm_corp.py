@@ -86,16 +86,19 @@ MODEL_REGISTRY: dict[str, list[str]] = {
     "tester": [
         "groq:groq/compound-mini",
         "groq:groq/compound",
+        "nvidia:meta/llama-3.3-70b-instruct",
         "cerebras:gemma-4-31b",
     ],
     "coder": [
         "groq:openai/gpt-oss-120b",
         "groq:openai/gpt-oss-20b",
+        "gemini:gemini-3.6-flash",
         "cerebras:gpt-oss-120b",
     ],
     "security": [
         "groq:openai/gpt-oss-safeguard-20b",
         "groq:groq/compound",
+        "nvidia:meta/llama-3.3-70b-instruct",
         "cerebras:llama-3.3-70b",
     ],
     "reviewer": [
