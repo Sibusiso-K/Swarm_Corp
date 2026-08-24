@@ -45,6 +45,8 @@ from sandbox import sandbox_run
 from context import load_repo_context
 from providers import available_providers, get_client, get_tpm_limit, split_ref
 import ui
+import tools
+import gates
 
 # Windows terminals often default to cp1252, which can't encode the em-dashes
 # and other punctuation used in these messages. Force UTF-8 on stdout so
@@ -535,6 +537,73 @@ def parse_and_write_files(coder_output: str, workspace_root: Path, allow_tests: 
     return written
 
 
+# ---------------------------------------------------------------------------
+# Tool calling — bounded, opt-in, free-tools-only from this loop.
+#
+# The Coder may ask for AT MOST ONE tool call per round, via a
+# "=== TOOL: name(k=v, ...) ===" block on its own line anywhere in its
+# output (same split-and-parse shape as === FILE: === above). The result
+# is fed back as feedback for the NEXT round — this is deliberately not a
+# nested per-round loop (call tool, re-prompt, call tool again...): that
+# would make the token cost of a single round open-ended, which is exactly
+# what TokenBudget exists to prevent. One request, one result, one round.
+# ---------------------------------------------------------------------------
+_TOOL_REQUEST_RE = re.compile(r"^=== TOOL:\s*(\w+)\((.*?)\)\s*===\s*$", re.MULTILINE)
+
+# Only tools.py's free/unattended functions — gated ones require input()
+# and have no place firing automatically inside an unattended run.
+TOOL_DISPATCH: dict[str, Callable[..., dict]] = {
+    "read_file": tools.read_file,
+    "list_dir": tools.list_dir,
+    "grep": tools.grep,
+    "git_status": tools.git_status,
+    "git_diff": tools.git_diff,
+    "git_log": tools.git_log,
+    "http_get": tools.http_get,
+}
+
+
+def parse_tool_request(coder_output: str) -> tuple[str, dict[str, str]] | None:
+    """Find the first (only the first is honored — one call per round)
+    '=== TOOL: name(k=v, ...) ===' block. Returns (name, kwargs) or None."""
+    match = _TOOL_REQUEST_RE.search(coder_output)
+    if match is None:
+        return None
+    name, arg_str = match.group(1), match.group(2)
+    kwargs: dict[str, str] = {}
+    for part in arg_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            continue  # malformed arg, skip rather than crash the round
+        k, v = part.split("=", 1)
+        kwargs[k.strip()] = v.strip().strip("'\"")
+    return name, kwargs
+
+
+def run_tool_request(coder_output: str) -> str | None:
+    """If the Coder asked for a tool, run it and return a feedback string
+    to prepend to next round's prompt. Returns None if no request was made
+    or the requested tool isn't in the free-tool dispatch table."""
+    parsed = parse_tool_request(coder_output)
+    if parsed is None:
+        return None
+    name, kwargs = parsed
+    fn = TOOL_DISPATCH.get(name)
+    if fn is None:
+        return f"Tool request '{name}' is not available (not a free/unattended tool). Available: {', '.join(TOOL_DISPATCH)}."
+    try:
+        result = fn(**kwargs)
+    except TypeError as exc:
+        return f"Tool '{name}' call failed — bad arguments: {exc}"
+    if result.get("ok"):
+        # Already redacted inside tools.py before this ever reaches here.
+        body = result.get("content") or result.get("output") or result.get("entries") or result.get("matches") or "(no content)"
+        return f"Tool '{name}' result:\n{body}"
+    return f"Tool '{name}' failed: {result.get('error', 'unknown error')}"
+
+
 def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = None) -> int:
     providers = available_providers()
     if not providers:
@@ -575,6 +644,15 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
         "import sys, pathlib\nsys.path.insert(0, str(pathlib.Path(__file__).parent))\n",
         encoding="utf-8",
     )
+
+    # Free tools (read_file/list_dir/grep/git-readonly/http_get) are
+    # confined to the workspace plus --repo, if given. Gated tools exist in
+    # tools.py but aren't auto-dispatched from this loop — an unattended
+    # run shouldn't block on input() unexpectedly mid-swarm.
+    tool_roots = [workspace_root]
+    if repo_path:
+        tool_roots.append(Path(repo_path).resolve())
+    tools.configure(allowed_roots=tool_roots)
 
     ui.note(f"Planner  : {models['planner']}")
     ui.note(f"Tester   : {models['tester']}")
@@ -643,6 +721,20 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
             ui.start_role("Coder", models["coder"])
             attempt = complete(budget, models["coder"], coder_persona, coder_user, temperature=0.3, on_chunk=ui.stream_chunk)
             ui.end_role()
+
+            # A tool request consumes this round as a pure info-gathering
+            # round: skip file-writing/sandbox/review, feed the result back
+            # as feedback, move straight to the next round. This does cost
+            # one of MAX_ROUNDS's code-writing attempts — a deliberate
+            # tradeoff for keeping tool calls bounded (see run_tool_request's
+            # docstring) rather than letting a round's token cost be
+            # open-ended.
+            tool_feedback = run_tool_request(attempt)
+            if tool_feedback is not None:
+                ui.status(f"  Tool request handled (round used for info-gathering, not a submission)")
+                feedback = tool_feedback
+                history.append({"round": str(round_no), "attempt": attempt, "review": f"(tool round)\n{tool_feedback}", "verdict": "TOOL"})
+                continue
 
             # Parse and write files (excluding tests, which are Tester's domain)
             try:

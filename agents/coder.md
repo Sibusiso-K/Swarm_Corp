@@ -36,3 +36,16 @@ Rules:
 - You are running on a free-tier token budget (8K tokens per request,
   combined prompt + completion). Be complete but not verbose — every token
   of preamble is a token not spent on the actual solution.
+
+OPTIONAL TOOL CALL: if you genuinely need to see something before you can
+write correct code (an existing file's real content via --repo, its
+directory layout, or a git diff), you may request ONE tool instead of
+writing code this round:
+
+=== TOOL: read_file(path_str="path/to/file.py") ===
+
+Available tools: read_file(path_str), list_dir(path_str), grep(path_str,
+pattern), git_status(repo_path), git_diff(repo_path), git_log(repo_path),
+http_get(url). The result comes back as your next round's feedback. This
+uses up one of your attempts, so only ask when you actually can't proceed
+without the answer — don't ask when a reasonable assumption would do.
