@@ -66,42 +66,44 @@ OUTPUT_DIR = ROOT / "swarm_output"
 # your configured keys wins. A bare slug (no colon) means Groq, so the original
 # single-provider config still resolves unchanged.
 #
-# Cerebras is listed first for Coder/Tester: at 60K TPM vs Groq's 8K it is the
-# difference between running and waiting out 60s windows mid-round.
+# NOTE on ordering: live_model_refs() only confirms a model appears in the
+# provider's /models catalog, not that inference actually succeeds. Live
+# testing found Cerebras lists models on this account but returns 402
+# payment_required on every call (free-tier trial not active on this key) —
+# so Cerebras candidates are placed LAST, not first. If billing gets
+# activated later, they'll start winning automatically with no code change;
+# until then, Coder/Planner/Tester fall through to providers that actually
+# answer (NVIDIA, Groq).
 MODEL_REGISTRY: dict[str, list[str]] = {
     "planner": [
-        "cerebras:llama-3.3-70b",
         "groq:openai/gpt-oss-20b",
-        "gemini:gemini-2.0-flash",
+        "gemini:gemini-3.6-flash",
         "groq:openai/gpt-oss-120b",
+        "cerebras:gpt-oss-120b",
     ],
     "tester": [
-        "cerebras:qwen-3-235b-a22b-instruct-2507",
-        "nvidia:mistralai/mistral-large-2-instruct",
         "groq:groq/compound-mini",
         "groq:groq/compound",
+        "cerebras:gemma-4-31b",
     ],
     "coder": [
-        "cerebras:qwen-3-coder-480b",
         "groq:openai/gpt-oss-120b",
-        "nvidia:qwen/qwen2.5-coder-32b-instruct",
         "groq:openai/gpt-oss-20b",
+        "cerebras:gpt-oss-120b",
     ],
     "security": [
         "groq:openai/gpt-oss-safeguard-20b",
-        "nvidia:deepseek-ai/deepseek-r1",
-        "cerebras:llama-3.3-70b",
         "groq:groq/compound",
+        "cerebras:llama-3.3-70b",
     ],
     "reviewer": [
         "groq:qwen/qwen3.6-27b",
-        "nvidia:deepseek-ai/deepseek-r1",
-        "gemini:gemini-2.5-pro",
+        "gemini:gemini-pro-latest",
         "groq:groq/compound-mini",
     ],
     "arbiter": [
         "nvidia:meta/llama-3.3-70b-instruct",
-        "gemini:gemini-2.5-pro",
+        "gemini:gemini-pro-latest",
         "groq:groq/compound",
         "groq:groq/compound-mini",
     ],
@@ -118,8 +120,18 @@ def family_of(ref: str) -> str:
     The provider is deliberately NOT the family: the same open-weight model
     served by two providers shares its blind spots, so diversity has to be
     measured on the model, not on who hosts it.
+
+    Different providers publish the SAME model under different slug shapes —
+    Groq calls it 'openai/gpt-oss-120b', Cerebras just 'gpt-oss-120b' — so a
+    naive parse would report those as different families and let two
+    instances of the identical model satisfy a diversity check. Known
+    multi-provider model names are normalised here first.
     """
     _, slug = split_ref(ref)
+    slug = slug.lower()
+    for known in ("gpt-oss", "llama-3.3", "llama-4", "qwen3", "qwen-3", "deepseek", "mistral", "gemma"):
+        if known in slug:
+            return known
     if "/" in slug:
         return slug.split("/")[0]
     return slug.split("-")[0]
@@ -457,6 +469,12 @@ def parse_and_write_files(coder_output: str, workspace_root: Path, allow_tests: 
         # so content starts with "\n" — the leading \s* is load-bearing.
         content = re.sub(r"^\s*```[\w+-]*[ \t]*\n", "", content)
         content = re.sub(r"\n```[ \t]*\s*$", "\n", content)
+
+        # Strip an invented trailing sentinel some models append after the
+        # last file (e.g. "=== END ==="), even though it's not part of the
+        # === FILE: ... === contract. Left in, it lands as the last line of
+        # real code and breaks ast.parse on anything Python.
+        content = re.sub(r"\n=+\s*END\s*=+\s*$", "\n", content, flags=re.IGNORECASE)
 
         # Security: reject paths that try to escape or overwrite tests
         if ".." in file_path_str or file_path_str.startswith("/"):
