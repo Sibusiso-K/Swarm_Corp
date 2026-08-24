@@ -50,6 +50,40 @@ PROVIDERS = {
         "tpm_limit": 250000,
         "description": "Google AI Studio (15 RPM, 1500 RPD)",
     },
+    "openrouter": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "key_env": "OPENROUTER_API_KEY",
+        # Free (":free"-suffixed) models are capped by requests/day, not TPM.
+        "tpm_limit": 30000,
+        "description": "OpenRouter (aggregator; :free models, ~50 req/day)",
+    },
+    "github": {
+        # GitHub Models — OpenAI-compatible, authed with a GitHub PAT.
+        "base_url": "https://models.github.ai/inference",
+        "key_env": "GITHUB_API_KEY",
+        "tpm_limit": 8000,
+        "description": "GitHub Models (free tier, PAT-authed)",
+    },
+    "sambanova": {
+        "base_url": "https://api.sambanova.ai/v1",
+        "key_env": "SAMBANOVA_CLOUD_API_KEY",
+        "tpm_limit": 30000,
+        "description": "SambaNova Cloud (fast Llama inference)",
+    },
+    "mistral": {
+        "base_url": "https://api.mistral.ai/v1",
+        "key_env": "MISTRAL_API_KEY",
+        "tpm_limit": 30000,
+        "description": "Mistral La Plateforme (free tier)",
+    },
+    # NOTE: Cloudflare Workers AI is deliberately NOT registered, despite
+    # CLOUDFLARE_API_KEY being set. Its OpenAI-compatible endpoint is
+    #   https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1
+    # and there's no CLOUDFLARE_ACCOUNT_ID in .env. Registering it with a
+    # blank/guessed account id would give a provider that reports as
+    # "available" and then fails on every call — the exact listing-vs-serving
+    # trap that already cost two debugging rounds with Cerebras and NVIDIA.
+    # Add CLOUDFLARE_ACCOUNT_ID to .env and this can be enabled properly.
     "ollama": {
         "base_url": "http://localhost:11434/v1",
         "key_env": None,  # Ollama runs locally, no key needed
