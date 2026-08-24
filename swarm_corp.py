@@ -638,6 +638,10 @@ def run_tool_request(coder_output: str) -> str | None:
         result = fn(**kwargs)
     except TypeError as exc:
         return f"Tool '{name}' call failed — bad arguments: {exc}"
+    except Exception as exc:  # noqa: BLE001 - a tool must never crash the run
+        return f"Tool '{name}' raised {type(exc).__name__}: {exc}"
+    if not isinstance(result, dict):
+        return f"Tool '{name}' returned an unexpected result type; ignoring."
     if result.get("ok"):
         # Already redacted inside tools.py before this ever reaches here.
         body = result.get("content") or result.get("output") or result.get("entries") or result.get("matches") or "(no content)"
@@ -1017,7 +1021,7 @@ def _run_pipeline(
                 history.append({"round": "arbiter", "attempt": attempt, "review": arbiter_review, "verdict": arbiter_verdict})
                 if arbiter_verdict == "APPROVE":
                     _write_output(task, history, approved=True)
-                    print(f"\n[OK] Arbiter approved. Output written to swarm_output/.")
+                    print("\n[OK] Arbiter approved. Output written to swarm_output/.")
                     return 0
                 # Feed Arbiter's specific instruction, not the Reviewer's
                 reasoning = arbiter_reasoning

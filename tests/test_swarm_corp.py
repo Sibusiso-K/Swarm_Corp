@@ -1,6 +1,5 @@
 """Unit tests for swarm_corp core functions."""
 
-import pytest
 from swarm_corp import estimate_tokens, extract_verdict, _find_truncation_point
 
 

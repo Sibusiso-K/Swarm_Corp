@@ -6,7 +6,6 @@ Budget: ~1500 tokens max (samples + tree).
 """
 
 from pathlib import Path
-from typing import Optional
 
 
 def load_repo_context(repo_path: str, token_budget: int = 1500) -> str:

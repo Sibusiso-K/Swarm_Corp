@@ -25,7 +25,7 @@ import sys
 from dotenv import load_dotenv
 
 from providers import available_providers
-from swarm_corp import MODEL_REGISTRY, family_of, live_model_refs, resolve_models, complete, TokenBudget
+from swarm_corp import MODEL_REGISTRY, live_model_refs, resolve_models, complete, TokenBudget
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -63,7 +63,7 @@ def main() -> int:
         print(f"\n[FAIL] {exc}")
         return 1
 
-    print(f"\n[OK] Family diversity constraints satisfied across all roles.")
+    print("\n[OK] Family diversity constraints satisfied across all roles.")
 
     print("\nRunning a small completion against the Coder model to confirm it actually serves, not just lists...")
     try:

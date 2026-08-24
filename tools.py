@@ -108,7 +108,13 @@ def list_dir(path_str: str) -> dict[str, Any]:
 def grep(path_str: str, pattern: str, max_matches: int = 50) -> dict[str, Any]:
     import re
     p = _confine(path_str)
-    rx = re.compile(pattern)
+    # The pattern comes from the Coder. An invalid regex raises re.error,
+    # which run_tool_request only catches as TypeError — so without this it
+    # crashes the whole run instead of failing one tool call cleanly.
+    try:
+        rx = re.compile(pattern)
+    except re.error as exc:
+        return {"ok": False, "error": f"invalid regex {pattern!r}: {exc}"}
     matches: list[str] = []
     files = [p] if p.is_file() else list(p.rglob("*.py")) + list(p.rglob("*.md"))
     for f in files:

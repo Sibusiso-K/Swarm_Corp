@@ -8,7 +8,6 @@ of which are process-level flags the human set before the run started, not
 anything a model can influence mid-run.
 """
 
-import sys
 
 _dry_run = False
 _pre_allowed: set[str] = set()

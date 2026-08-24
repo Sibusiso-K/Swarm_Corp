@@ -80,7 +80,7 @@ def run_comparison(task: str, strategies: list[str] | None = None) -> list[dict]
             criteria = str(exc)
             ok = False
         elapsed = time.time() - start
-        criterion_lines = [l for l in criteria.split("\n") if l.strip().startswith("-")]
+        criterion_lines = [line for line in criteria.split("\n") if line.strip().startswith("-")]
         record = {
             "task": task,
             "strategy": strategy,
