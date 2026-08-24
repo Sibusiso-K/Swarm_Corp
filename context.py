@@ -1,5 +1,5 @@
 """
-agent_swarm_context.py — load repo file tree and sample existing code.
+context.py — load repo file tree and sample existing code.
 Prepend to Coder prompt so it has context instead of asking "what's in the repo?"
 
 Budget: ~1500 tokens max (samples + tree).

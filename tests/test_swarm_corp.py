@@ -1,7 +1,7 @@
-"""Unit tests for agent_swarm core functions."""
+"""Unit tests for swarm_corp core functions."""
 
 import pytest
-from agent_swarm import estimate_tokens, extract_verdict, _find_truncation_point
+from swarm_corp import estimate_tokens, extract_verdict, _find_truncation_point
 
 
 class TestEstimateTokens:

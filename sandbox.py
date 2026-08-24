@@ -1,5 +1,5 @@
 """
-agent_swarm_sandbox.py — run Coder-generated code in a confined subprocess
+sandbox.py — run Coder-generated code in a confined subprocess
 and return test/compile results. This provides evidence-based feedback to the
 Reviewer without spending a token call on guessing whether code actually works.
 

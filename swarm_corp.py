@@ -1,5 +1,5 @@
 """
-agent_swarm.py — a small multi-role coding swarm running entirely on free
+swarm_corp.py — a small multi-role coding swarm running entirely on free
 LLM provider tiers (Groq, Cerebras, NVIDIA NIM, Google AI Studio; Ollama for
 local/Phase 5). See CLAUDE.md for the constraints this file has to honor:
 
@@ -18,7 +18,7 @@ local/Phase 5). See CLAUDE.md for the constraints this file has to honor:
     SWARM_TIER yourself if you ever want it; the swarm never will.
 
 Usage:
-    python agent_swarm.py "add a /health endpoint with a test"
+    python swarm_corp.py "add a /health endpoint with a test"
 
 Escalation lane: if the swarm can't get something approved after
 MAX_ROUNDS, it writes its last attempt + the Reviewer's objections to
@@ -40,8 +40,8 @@ import groq
 import openai
 from dotenv import load_dotenv
 
-from agent_swarm_sandbox import sandbox_run
-from agent_swarm_context import load_repo_context
+from sandbox import sandbox_run
+from context import load_repo_context
 from providers import available_providers, get_client, get_tpm_limit, split_ref
 
 # Windows terminals often default to cp1252, which can't encode the em-dashes
