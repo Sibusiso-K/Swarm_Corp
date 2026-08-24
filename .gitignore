@@ -6,3 +6,4 @@ venv/
 *.egg-info/
 .pytest_cache/
 swarm_output/
+bench/results.jsonl
