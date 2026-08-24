@@ -212,10 +212,9 @@ def http_get(url: str, timeout_sec: int = 10) -> dict[str, Any]:
     if parsed.scheme not in {"http", "https"}:
         return {"ok": False, "error": f"unsupported scheme '{parsed.scheme}' (http/https only)"}
     host = parsed.hostname or ""
-    # DEFAULT DENY. An empty allowlist previously meant "no restriction",
-    # which made every normal run able to fetch any URL on the internet
-    # unattended (tools.configure() is called without allowed_domains). It
-    # now means "nothing allowed" — opt in with --allow-domains.
+    # DEFAULT DENY. An empty allowlist means "nothing allowed", NOT "no
+    # restriction" — the latter (the original bug) let every run fetch any
+    # URL unattended. Opt in per-run with --allow-domains.
     if not ALLOWED_DOMAINS:
         return {"ok": False, "error": "no domains allowlisted; pass --allow-domains example.com,docs.python.org"}
     if not any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS):
