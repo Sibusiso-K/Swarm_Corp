@@ -632,7 +632,13 @@ def run_tool_request(coder_output: str) -> str | None:
     return f"Tool '{name}' failed: {result.get('error', 'unknown error')}"
 
 
-def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = None, private: bool = False) -> int:
+def run_swarm(
+    task: str,
+    max_rounds: int = MAX_ROUNDS,
+    repo_path: str | None = None,
+    private: bool = False,
+    template: str | None = None,
+) -> int:
     if private:
         from providers import ollama_is_running
         if not ollama_is_running():
@@ -652,7 +658,7 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
         ui.note("  NOTE: one local model means Coder and Reviewer share a family.")
         ui.note("  The cross-family review guarantee does NOT hold in this mode.")
         models = {role: PRIVATE_MODEL for role in MODEL_REGISTRY}
-        return _run_pipeline(task, models, max_rounds, repo_path, private=True)
+        return _run_pipeline(task, models, max_rounds, repo_path, private=True, template=template)
 
     providers = available_providers()
     if not providers:
@@ -669,7 +675,7 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
         print(f"[FAIL] {exc}")
         return 1
 
-    return _run_pipeline(task, models, max_rounds, repo_path, private=False)
+    return _run_pipeline(task, models, max_rounds, repo_path, private=False, template=template)
 
 
 def _run_pipeline(
@@ -678,6 +684,7 @@ def _run_pipeline(
     max_rounds: int,
     repo_path: str | None,
     private: bool,
+    template: str | None = None,
 ) -> int:
     """The Planner->Tester->Coder<->Sandbox<->Review->Arbiter pipeline,
     shared by the normal multi-provider path and --private (where `models`
@@ -734,9 +741,17 @@ def _run_pipeline(
 
     # Phase 1: Planner writes acceptance criteria
     ui.status("--- planning ---")
+    planner_user = f"Task:\n{task}"
+    if template:
+        template_path = ROOT / "templates" / f"{template}.md"
+        if template_path.exists():
+            planner_user = f"{template_path.read_text(encoding='utf-8')}\n\n{planner_user}"
+            ui.note(f"Template : {template}")
+        else:
+            ui.status(f"  (unknown template '{template}', ignoring — see templates/ for valid names)")
     try:
         ui.start_role("Planner", models["planner"])
-        criteria = complete(budget, models["planner"], planner_persona, f"Task:\n{task}", temperature=0.3, on_chunk=ui.stream_chunk)
+        criteria = complete(budget, models["planner"], planner_persona, planner_user, temperature=0.3, on_chunk=ui.stream_chunk)
         ui.end_role()
     except RuntimeError as exc:
         print(f"[FAIL] {exc}")
@@ -1008,6 +1023,15 @@ if __name__ == "__main__":
             "the printed warning."
         ),
     )
+    parser.add_argument(
+        "--template",
+        default=None,
+        help=(
+            "Preload the Planner with domain-specific acceptance-criteria "
+            "hints from templates/<name>.md (e.g. 'fastapi_service', "
+            "'langgraph_agent'). See the templates/ directory for the full list."
+        ),
+    )
     args = parser.parse_args()
 
     gates.configure(
@@ -1016,4 +1040,4 @@ if __name__ == "__main__":
     )
 
     ui.init(plain=args.plain)
-    sys.exit(run_swarm(args.task, repo_path=args.repo, private=args.private))
+    sys.exit(run_swarm(args.task, repo_path=args.repo, private=args.private, template=args.template))
