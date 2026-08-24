@@ -29,12 +29,6 @@ PROVIDERS = {
         "tpm_limit": 8000,
         "description": "Groq (6-12K TPM per model, 30 RPM)",
     },
-    "cerebras": {
-        "base_url": "https://api.cerebras.ai/v1",
-        "key_env": "CEREBRAS_API_KEY",
-        "tpm_limit": 60000,
-        "description": "Cerebras (60K TPM, 30 RPM) — preferred for Coder",
-    },
     "nvidia": {
         "base_url": "https://integrate.api.nvidia.com/v1",
         "key_env": "NVIDIA_API_KEY",
@@ -57,25 +51,50 @@ PROVIDERS = {
         "tpm_limit": 30000,
         "description": "OpenRouter (aggregator; :free models, ~50 req/day)",
     },
-    "github": {
-        # GitHub Models — OpenAI-compatible, authed with a GitHub PAT.
-        "base_url": "https://models.github.ai/inference",
-        "key_env": "GITHUB_API_KEY",
-        "tpm_limit": 8000,
-        "description": "GitHub Models (free tier, PAT-authed)",
-    },
-    "sambanova": {
-        "base_url": "https://api.sambanova.ai/v1",
-        "key_env": "SAMBANOVA_CLOUD_API_KEY",
-        "tpm_limit": 30000,
-        "description": "SambaNova Cloud (fast Llama inference)",
-    },
     "mistral": {
         "base_url": "https://api.mistral.ai/v1",
         "key_env": "MISTRAL_API_KEY",
         "tpm_limit": 30000,
         "description": "Mistral La Plateforme (free tier)",
     },
+    "huggingface": {
+        "base_url": "https://router.huggingface.co/v1",
+        "key_env": "HUGGINGFACE_API_KEY",
+        "tpm_limit": 8000,
+        "description": "HuggingFace Inference Providers (router)",
+    },
+    "siliconflow": {
+        "base_url": "https://api.siliconflow.com/v1",
+        "key_env": "SILICONFLOW_API_KEY",
+        "tpm_limit": 30000,
+        "description": "SiliconFlow",
+    },
+    "cohere": {
+        "base_url": "https://api.cohere.ai/compatibility/v1",
+        "key_env": "COHERE_API_KEY",
+        "tpm_limit": 30000,
+        "description": "Cohere (OpenAI-compat endpoint)",
+    },
+    # REMOVED after live testing (key set, but cannot serve):
+    #   cerebras  — 402 payment_required on every model
+    #   sambanova — 402 balance_units: 0
+    #   github    — 410 Gone, GitHub Models is retired
+    #   fireworks — 412 account not ready
+    #   chutes/deepseek/novita/aiml/deepinfra — 402/403 zero balance
+    # All were removed rather than left as fallbacks: each one costs a
+    # failing HTTP call on every startup inside live_model_refs().
+    # NOTE: Fireworks AI removed — the key is set but the account returns
+    # 412 ("Account not ready"/unverified) on /models, so it can neither
+    # list nor serve. Re-add if the account is activated.
+    "baseten": {
+        "base_url": "https://inference.baseten.co/v1",
+        "key_env": "BASETEN_API_KEY",
+        "tpm_limit": 30000,
+        "description": "Baseten",
+    },
+    # NOTE: Modal Labs is NOT registered — its endpoints are per-deployment
+    # URLs unique to whatever you've deployed, not one shared base_url, so
+    # there's nothing correct to hardcode here. Same reasoning as Cloudflare.
     # NOTE: Cloudflare Workers AI is deliberately NOT registered, despite
     # CLOUDFLARE_API_KEY being set. Its OpenAI-compatible endpoint is
     #   https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1
@@ -103,7 +122,9 @@ def get_client(provider: str, api_key: Optional[str] = None) -> OpenAI:
         raise ValueError(f"Unknown provider: {provider}. Available: {list(PROVIDERS.keys())}")
 
     cfg = PROVIDERS[provider]
-    key = api_key or os.environ.get(cfg["key_env"], "")
+    # key_env is None for local providers (Ollama). os.environ.get(None)
+    # raises TypeError, so guard before the lookup rather than after.
+    key = api_key or (os.environ.get(cfg["key_env"], "") if cfg["key_env"] else "")
 
     # Ollama doesn't need a key
     if provider == "ollama":
