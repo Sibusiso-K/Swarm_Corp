@@ -33,6 +33,7 @@ import os
 import re
 import sys
 import time
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -43,6 +44,7 @@ from dotenv import load_dotenv
 from sandbox import sandbox_run
 from context import load_repo_context
 from providers import available_providers, get_client, get_tpm_limit, split_ref
+import ui
 
 # Windows terminals often default to cp1252, which can't encode the em-dashes
 # and other punctuation used in these messages. Force UTF-8 on stdout so
@@ -360,12 +362,27 @@ def _fit_user_text(system: str, user: str, budget: TokenBudget, ref: str) -> str
     return head + ELISION_MARKER + tail
 
 
-def complete(budget: TokenBudget, ref: str, system: str, user: str, temperature: float) -> str:
+def complete(
+    budget: TokenBudget,
+    ref: str,
+    system: str,
+    user: str,
+    temperature: float,
+    on_chunk: Callable[[str], None] | None = None,
+) -> str:
     """Call the ref's provider with exponential backoff on 429/503.
 
     ref is a "provider:model" string (e.g. "cerebras:llama-3.3-70b"); a bare
     slug with no colon defaults to groq. One client per call keeps this
-    stateless with respect to which provider each role landed on this run."""
+    stateless with respect to which provider each role landed on this run.
+
+    on_chunk, if given, streams the response and is called once per text
+    delta as it arrives (ui.stream_chunk). The returned string is always the
+    full assembled text either way — streaming changes what you see live,
+    not what callers receive. Token accounting is unaffected: providers that
+    support stream_options={"include_usage": True} (Groq, OpenAI-compatible)
+    return real usage in the final chunk; if a provider doesn't, usage falls
+    back to the same estimate the non-streaming path already used."""
     provider, model = split_ref(ref)
     client = get_client(provider)
 
@@ -377,6 +394,31 @@ def complete(budget: TokenBudget, ref: str, system: str, user: str, temperature:
     for attempt in range(max_retries):
         budget.wait_if_needed(ref, estimate_tokens(prompt_text) + max_tokens)
         try:
+            if on_chunk is not None:
+                stream = client.chat.completions.create(
+                    model=model,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    stream=True,
+                    stream_options={"include_usage": True},
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                )
+                text_parts: list[str] = []
+                usage_tokens = None
+                for chunk in stream:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        delta = chunk.choices[0].delta.content
+                        text_parts.append(delta)
+                        on_chunk(delta)
+                    if getattr(chunk, "usage", None):
+                        usage_tokens = chunk.usage.total_tokens
+                full_text = "".join(text_parts)
+                budget.record(ref, usage_tokens or (estimate_tokens(prompt_text) + estimate_tokens(full_text)))
+                return full_text
+
             resp = client.chat.completions.create(
                 model=model,
                 temperature=temperature,
@@ -498,7 +540,7 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
             "least GROQ_API_KEY in — see .env.example for the other free providers."
         )
         return 1
-    print(f"Providers: {', '.join(providers)}")
+    ui.note(f"Providers: {', '.join(providers)}")
 
     try:
         models = resolve_models()
@@ -531,38 +573,40 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
         encoding="utf-8",
     )
 
-    print(f"Planner  : {models['planner']}")
-    print(f"Tester   : {models['tester']}")
-    print(f"Coder    : {models['coder']}")
-    print(f"Security : {models['security']}")
-    print(f"Reviewer : {models['reviewer']}")
-    print(f"Arbiter  : {models['arbiter']}")
+    ui.note(f"Planner  : {models['planner']}")
+    ui.note(f"Tester   : {models['tester']}")
+    ui.note(f"Coder    : {models['coder']}")
+    ui.note(f"Security : {models['security']}")
+    ui.note(f"Reviewer : {models['reviewer']}")
+    ui.note(f"Arbiter  : {models['arbiter']}")
     if repo_context:
-        print(f"Repo     : {repo_path}\n")
+        ui.note(f"Repo     : {repo_path}\n")
     else:
-        print()
+        ui.note("")
 
     # Phase 1: Planner writes acceptance criteria
-    print("--- planning ---")
+    ui.status("--- planning ---")
     try:
-        print("  Planner is thinking...")
-        criteria = complete(budget, models["planner"], planner_persona, f"Task:\n{task}", temperature=0.3)
+        ui.start_role("Planner", models["planner"])
+        criteria = complete(budget, models["planner"], planner_persona, f"Task:\n{task}", temperature=0.3, on_chunk=ui.stream_chunk)
+        ui.end_role()
     except RuntimeError as exc:
         print(f"[FAIL] {exc}")
         return 1
 
     # Phase 2: Tester writes tests based on criteria
-    print("--- testing (independent) ---")
+    ui.status("--- testing (independent) ---")
     try:
-        print("  Tester is writing tests...")
+        ui.start_role("Tester", models["tester"])
         tester_user = f"Acceptance criteria:\n{criteria}\n\nWrite tests based on these criteria, not implementation."
-        tests_output = complete(budget, models["tester"], tester_persona, tester_user, temperature=0.3)
+        tests_output = complete(budget, models["tester"], tester_persona, tester_user, temperature=0.3, on_chunk=ui.stream_chunk)
+        ui.end_role()
         try:
             test_files = parse_and_write_files(tests_output, workspace_root, allow_tests=True)
             if not test_files:
                 print("[FAIL] Tester produced no test files (bad === FILE: === format).")
                 return 1
-            print(f"  Wrote {len(test_files)} test file(s)")
+            ui.status(f"  Wrote {len(test_files)} test file(s)")
         except RuntimeError as exc:
             print(f"[FAIL] Tester output invalid: {exc}")
             return 1
@@ -577,7 +621,7 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
     history: list[dict[str, str]] = []
 
     for round_no in range(1, max_rounds + 1):
-        print(f"--- round {round_no} ---")
+        ui.status(f"--- round {round_no} ---")
         # The Coder sees the tests so it matches their import surface and
         # function signatures. Independence comes from the tests being written
         # before/blind to the implementation, not from hiding them.
@@ -593,17 +637,17 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
             coder_user += f"\n\nFeedback from prior round:\n{feedback}\n\nRevise accordingly."
 
         try:
-            print("  Coder is working...")
-            attempt = complete(budget, models["coder"], coder_persona, coder_user, temperature=0.3)
+            ui.start_role("Coder", models["coder"])
+            attempt = complete(budget, models["coder"], coder_persona, coder_user, temperature=0.3, on_chunk=ui.stream_chunk)
+            ui.end_role()
 
             # Parse and write files (excluding tests, which are Tester's domain)
-            print("  Writing implementation...")
             try:
                 written_files = parse_and_write_files(attempt, workspace_root)
                 if written_files:
-                    print(f"    Wrote {len(written_files)} file(s)")
+                    ui.status(f"  Wrote {len(written_files)} file(s)")
             except RuntimeError as exc:
-                print(f"    File write failed: {exc}")
+                ui.status(f"  File write failed: {exc}")
                 written_files = []
 
             # Run Tester's tests against Coder's implementation
@@ -617,20 +661,21 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
             # Auto-reject if tests failed (free reject, save a Reviewer call)
             # pytest reports failures on stdout, not stderr, so check both
             if not sandbox_result["passed"] and (sandbox_result["stderr"] or sandbox_result["stdout"]):
-                print(f"  [Auto-reject] Tests failed")
+                ui.status("  [Auto-reject] Tests failed")
                 output = sandbox_result["stderr"] or sandbox_result["stdout"]
                 synthetic_review = f"VERDICT: REJECT\n\nTests failed — fix the implementation:\n{output}"
                 review = synthetic_review
             else:
                 # Tests passed; run Security check (once, after first pass)
                 if not security_passed:
-                    print("  Security is checking...")
+                    ui.start_role("Security", models["security"])
                     security_user = f"Task:\n{task}\n\nCode:\n{attempt}"
                     try:
-                        security_output = complete(budget, models["security"], security_persona, security_user, temperature=0.2)
+                        security_output = complete(budget, models["security"], security_persona, security_user, temperature=0.2, on_chunk=ui.stream_chunk)
+                        ui.end_role()
                         security_verdict, _ = extract_verdict(security_output)
                         if security_verdict == "REJECT":
-                            print(f"  [Security] Issues found")
+                            ui.status("  [Security] Issues found")
                             review = security_output
                         else:
                             security_passed = True
@@ -643,9 +688,10 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
 
                 # Reviewer audits if Security passed
                 if review is None:
-                    print("  Reviewer is auditing...")
+                    ui.start_role("Reviewer", models["reviewer"])
                     review_user = f"Task:\n{task}\n\nAcceptance criteria:\n{criteria}\n\nCoder's submission:\n{attempt}\n\nTest results:\n{test_note}"
-                    review = complete(budget, models["reviewer"], reviewer_persona, review_user, temperature=0.2)
+                    review = complete(budget, models["reviewer"], reviewer_persona, review_user, temperature=0.2, on_chunk=ui.stream_chunk)
+                    ui.end_role()
 
         except RuntimeError as exc:
             print(f"[FAIL] {exc}")
@@ -658,10 +704,10 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
         # are told this, but prompt instructions are advisory — enforce it in
         # code so a false APPROVE can't exit 0 on broken output.
         if verdict == "APPROVE" and not sandbox_result["passed"]:
-            print("  (APPROVE overridden — tests are still failing)")
+            ui.status("  (APPROVE overridden — tests are still failing)")
             verdict = "REJECT"
             reasoning = f"Tests are still failing, so this cannot be approved:\n{sandbox_result['stderr'] or sandbox_result['stdout']}"
-        print(f"  Verdict: {verdict}")
+        ui.status(f"  Verdict: {verdict}")
         history.append({"round": str(round_no), "attempt": attempt, "review": review, "verdict": verdict})
 
         if verdict == "APPROVE":
@@ -670,15 +716,17 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
             return 0
 
         if verdict == "UNPARSEABLE":
-            print("  Verdict unclear; retrying...")
+            ui.status("  Verdict unclear; retrying...")
             retry_prompt = f"Task:\n{task}\n\nCode:\n{attempt[:500]}\n\nPlease state: VERDICT: APPROVE or VERDICT: REJECT (one line only)."
             try:
-                review = complete(budget, models["reviewer"], reviewer_persona, retry_prompt, temperature=0.2)
+                ui.start_role("Reviewer (retry)", models["reviewer"])
+                review = complete(budget, models["reviewer"], reviewer_persona, retry_prompt, temperature=0.2, on_chunk=ui.stream_chunk)
+                ui.end_role()
                 verdict, reasoning = extract_verdict(review)
                 if verdict == "APPROVE" and not sandbox_result["passed"]:
                     verdict = "REJECT"
                     reasoning = "Tests are still failing, so this cannot be approved."
-                print(f"  Verdict (retry): {verdict}")
+                ui.status(f"  Verdict (retry): {verdict}")
                 if verdict == "APPROVE":
                     _write_output(task, history, approved=True)
                     print(f"\n[OK] Approved after {round_no} round(s). Output written to swarm_output/.")
@@ -689,7 +737,7 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
 
         # Deadlock check: if round 3 and still rejected, escalate to Arbiter
         if round_no == max_rounds - 1 and verdict == "REJECT":
-            print("  Round 3 rejection; escalating to Arbiter...")
+            ui.status("  Round 3 rejection; escalating to Arbiter...")
             arbiter_user = f"Task:\n{task}\n\nCriteria:\n{criteria}\n\nRounds 1-3:\n"
             for h in history[-3:]:
                 arbiter_user += f"\nAttempt {h['round']}:\n{h['attempt'][:300]}\nReviewer: {h['review'][:200]}\n"
@@ -698,13 +746,15 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
             # without ever being shown the test results.
             arbiter_user += f"Test results for the final attempt:\n{test_note}\n\nBreak the deadlock."
             try:
-                arbiter_review = complete(budget, models["arbiter"], arbiter_persona, arbiter_user, temperature=0.2)
+                ui.start_role("Arbiter", models["arbiter"])
+                arbiter_review = complete(budget, models["arbiter"], arbiter_persona, arbiter_user, temperature=0.2, on_chunk=ui.stream_chunk)
+                ui.end_role()
                 arbiter_verdict, arbiter_reasoning = extract_verdict(arbiter_review)
                 if arbiter_verdict == "APPROVE" and not sandbox_result["passed"]:
-                    print("  (Arbiter APPROVE overridden — tests are still failing)")
+                    ui.status("  (Arbiter APPROVE overridden — tests are still failing)")
                     arbiter_verdict = "REJECT"
                     arbiter_reasoning = "Tests are still failing, so this cannot be approved."
-                print(f"  Arbiter: {arbiter_verdict}")
+                ui.status(f"  Arbiter: {arbiter_verdict}")
                 history.append({"round": "arbiter", "attempt": attempt, "review": arbiter_review, "verdict": arbiter_verdict})
                 if arbiter_verdict == "APPROVE":
                     _write_output(task, history, approved=True)
@@ -739,9 +789,15 @@ def _write_output(task: str, history: list[dict[str, str]], approved: bool) -> P
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Coder/Reviewer swarm on Groq free tier")
+    parser = argparse.ArgumentParser(description="Swarm_Corp: multi-provider coding swarm")
     parser.add_argument("task", help="Task description")
     parser.add_argument("--repo", help="Optional: path to repo for context injection", default=None)
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="Disable the Rich live UI (plain print()-per-line output; use for CI or piping).",
+    )
     args = parser.parse_args()
 
+    ui.init(plain=args.plain)
     sys.exit(run_swarm(args.task, repo_path=args.repo))
