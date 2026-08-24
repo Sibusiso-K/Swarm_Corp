@@ -282,7 +282,7 @@ class TokenBudget:
             if self._windows[ref]:
                 sleep_for = TPM_WINDOW_SECONDS - (now - self._windows[ref][0][0])
                 if sleep_for > 0:
-                    print(f"  (waiting {sleep_for:.0f}s — {ref} at {used} TPM, upcoming request needs {upcoming_tokens})")
+                    ui.status(f"  (waiting {sleep_for:.0f}s — {ref} at {used} TPM, upcoming request needs {upcoming_tokens})")
                     time.sleep(sleep_for)
             else:
                 raise RuntimeError(f"Requested {upcoming_tokens} tokens for {ref}, but cap is {limit} TPM and a single request cannot fit")
@@ -435,7 +435,7 @@ def complete(
             status = getattr(exc, "status_code", None)
             if status in {429, 503} and attempt < max_retries - 1:
                 wait_time = 2 ** attempt  # 1s, 2s, 4s
-                print(f"  (rate limited; retrying in {wait_time}s...)")
+                ui.status(f"  (rate limited; retrying in {wait_time}s...)")
                 time.sleep(wait_time)
                 continue
             raise RuntimeError(f"API call to {ref} failed ({status}): {exc}") from exc

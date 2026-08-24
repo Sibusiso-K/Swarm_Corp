@@ -77,7 +77,7 @@ def _render_thinking(text: str):
 
 
 def start_role(role: str, model_ref: str) -> None:
-    global _current_role, _current_model, _current_text
+    global _current_role, _current_model, _current_text, _live
     _current_role = role
     _current_model = model_ref
     _current_text = ""
@@ -86,9 +86,19 @@ def start_role(role: str, model_ref: str) -> None:
         print(f"  {role} is working... ({model_ref})")
         return
 
+    # Defensive: if the previous role raised mid-stream, end_role() never ran
+    # and its Live is still active — leaking a refresh thread and leaving the
+    # cursor hidden on a real terminal. Rich also permits only one live
+    # display at a time. Always close any stale one before opening ours.
+    if _live is not None:
+        try:
+            _live.stop()
+        except Exception:
+            pass
+        _live = None
+
     from rich.live import Live
     from rich.panel import Panel
-    global _live
     panel = Panel("", title=f"[bold]{role}[/bold] — {model_ref}", border_style="cyan")
     _live = Live(panel, console=_console, refresh_per_second=8)
     _live.start()
