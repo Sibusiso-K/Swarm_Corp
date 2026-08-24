@@ -122,6 +122,15 @@ MODEL_REGISTRY: dict[str, list[str]] = {
     ],
 }
 
+# Phase 5: every role runs on the local model in --private mode. Family
+# diversity is deliberately NOT enforced here — with one local model there
+# is only one family available, so the choice is "one model reviewing its
+# own output" or "send private code to a third party". For clinical/PII
+# work the privacy guarantee is worth more than the diversity check, but
+# it IS a real loss of review quality, and run_swarm() says so out loud
+# rather than letting it pass silently.
+PRIVATE_MODEL = "ollama:qwen2.5-coder:3b"
+
 MAX_ROUNDS = 4  # coder attempts before we punt to Claude Code
 # Cap on info-gathering rounds. Without this the Coder can spend every one
 # of MAX_ROUNDS asking for tools and never submit code — the run then
@@ -615,7 +624,28 @@ def run_tool_request(coder_output: str) -> str | None:
     return f"Tool '{name}' failed: {result.get('error', 'unknown error')}"
 
 
-def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = None) -> int:
+def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = None, private: bool = False) -> int:
+    if private:
+        from providers import ollama_is_running
+        if not ollama_is_running():
+            print("[FAIL] --private needs a local Ollama server, but nothing is answering on localhost:11434.")
+            return 1
+        try:
+            local_ids = {m.id for m in get_client("ollama").models.list().data or []}
+        except Exception as exc:
+            print(f"[FAIL] --private: could not query local Ollama models: {exc}")
+            return 1
+        _, want = split_ref(PRIVATE_MODEL)
+        if want not in local_ids:
+            print(f"[FAIL] --private needs '{want}' pulled locally. Run: ollama pull {want}")
+            return 1
+        ui.note("PRIVATE MODE — every role runs locally; nothing leaves this machine.")
+        ui.note(f"  All roles: {PRIVATE_MODEL}")
+        ui.note("  NOTE: one local model means Coder and Reviewer share a family.")
+        ui.note("  The cross-family review guarantee does NOT hold in this mode.")
+        models = {role: PRIVATE_MODEL for role in MODEL_REGISTRY}
+        return _run_pipeline(task, models, max_rounds, repo_path, private=True)
+
     providers = available_providers()
     if not providers:
         print(
@@ -631,6 +661,20 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
         print(f"[FAIL] {exc}")
         return 1
 
+    return _run_pipeline(task, models, max_rounds, repo_path, private=False)
+
+
+def _run_pipeline(
+    task: str,
+    models: dict[str, str],
+    max_rounds: int,
+    repo_path: str | None,
+    private: bool,
+) -> int:
+    """The Planner->Tester->Coder<->Sandbox<->Review->Arbiter pipeline,
+    shared by the normal multi-provider path and --private (where `models`
+    is every role pointed at the one local Ollama model instead of
+    resolve_models()'s per-role picks)."""
     # Load all personas
     coder_persona = load_persona("coder.md")
     reviewer_persona = load_persona("reviewer.md")
@@ -664,6 +708,8 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
     if repo_path:
         tool_roots.append(Path(repo_path).resolve())
     tools.configure(allowed_roots=tool_roots)
+    if private:
+        tools.disable_network()
 
     ui.note(f"Planner  : {models['planner']}")
     ui.note(f"Tester   : {models['tester']}")
@@ -926,6 +972,16 @@ if __name__ == "__main__":
             "by you — nothing a model emits can add to this."
         ),
     )
+    parser.add_argument(
+        "--private",
+        action="store_true",
+        help=(
+            "Route every role to the local Ollama model instead of cloud "
+            "providers, and disable network tools. Nothing leaves this "
+            "machine. Family diversity does NOT hold in this mode — see "
+            "the printed warning."
+        ),
+    )
     args = parser.parse_args()
 
     gates.configure(
@@ -934,4 +990,4 @@ if __name__ == "__main__":
     )
 
     ui.init(plain=args.plain)
-    sys.exit(run_swarm(args.task, repo_path=args.repo))
+    sys.exit(run_swarm(args.task, repo_path=args.repo, private=args.private))

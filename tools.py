@@ -26,12 +26,22 @@ from gates import approve
 
 ALLOWED_ROOTS: list[Path] = []  # populated by configure()
 ALLOWED_DOMAINS: set[str] = set()
+NETWORK_DISABLED = False  # --private's hard kill-switch, see disable_network()
 
 
 def configure(allowed_roots: list[Path], allowed_domains: set[str] | None = None) -> None:
     global ALLOWED_ROOTS, ALLOWED_DOMAINS
     ALLOWED_ROOTS = [r.resolve() for r in allowed_roots]
     ALLOWED_DOMAINS = allowed_domains or set()
+
+
+def disable_network() -> None:
+    """--private calls this. NETWORK_DISABLED is checked before
+    ALLOWED_DOMAINS — an empty ALLOWED_DOMAINS means "no allowlist
+    configured" (unrestricted), not "deny everything", so relying on it
+    alone would not actually block network access in private mode."""
+    global NETWORK_DISABLED
+    NETWORK_DISABLED = True
 
 
 def _confine(path_str: str) -> Path:
@@ -161,6 +171,8 @@ def _git_readonly(repo_path: str, args: list[str]) -> dict[str, Any]:
 
 
 def http_get(url: str, timeout_sec: int = 10) -> dict[str, Any]:
+    if NETWORK_DISABLED:
+        return {"ok": False, "error": "network access disabled (--private mode)"}
     from urllib.parse import urlparse
     host = urlparse(url).hostname or ""
     if ALLOWED_DOMAINS and not any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS):
@@ -213,6 +225,8 @@ def git_push(repo_path: str) -> dict[str, Any]:
 
 
 def http_write(url: str, method: str, body: str = "") -> dict[str, Any]:
+    if NETWORK_DISABLED:
+        return {"ok": False, "error": "network access disabled (--private mode)"}
     if method.upper() not in {"POST", "PUT", "DELETE", "PATCH"}:
         return {"ok": False, "error": f"unsupported method: {method}"}
     if not approve("network_write", f"{method.upper()} {url} (body: {len(body)} chars)"):
