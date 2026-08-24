@@ -1,11 +1,13 @@
 """
-agent_swarm.py — a small Coder/Reviewer swarm running entirely on Groq's
-free tier. See CLAUDE.md for the constraints this file has to honor:
+agent_swarm.py — a small multi-role coding swarm running entirely on free
+LLM provider tiers (Groq, Cerebras, NVIDIA NIM, Google AI Studio; Ollama for
+local/Phase 5). See CLAUDE.md for the constraints this file has to honor:
 
-  - Groq only. No paid API keys required to run the default path.
-  - Every single completion request is capped at MAX_TOKENS_PER_REQUEST
-    (8000) combined prompt+completion tokens, to stay inside free-tier
-    per-minute limits without needing you to think about it.
+  - Free tiers only, across every provider in providers.py. No paid API
+    keys required to run the default (Groq-only) path.
+  - Every completion request is capped per its OWN provider's TPM limit
+    (see providers.PROVIDERS) — Cerebras's 60K is not Groq's 8K, and both
+    are enforced independently via TokenBudget.
   - The Reviewer must resolve to a different model *family* than the
     Coder (checked at startup, not just hoped for) — the whole point of
     a second reviewing model is that it doesn't share the first one's
@@ -35,11 +37,12 @@ from datetime import datetime
 from pathlib import Path
 
 import groq
+import openai
 from dotenv import load_dotenv
-from groq import Groq
 
 from agent_swarm_sandbox import sandbox_run
 from agent_swarm_context import load_repo_context
+from providers import available_providers, get_client, get_tpm_limit, split_ref
 
 # Windows terminals often default to cp1252, which can't encode the em-dashes
 # and other punctuation used in these messages. Force UTF-8 on stdout so
@@ -59,40 +62,106 @@ OUTPUT_DIR = ROOT / "swarm_output"
 # drift — that's expected, not a bug — so this list is meant to be edited.
 # Run `python verify_key.py` after editing it.
 # ---------------------------------------------------------------------------
+# Candidates are "provider:model" refs, tried in order; the first one live on
+# your configured keys wins. A bare slug (no colon) means Groq, so the original
+# single-provider config still resolves unchanged.
+#
+# Cerebras is listed first for Coder/Tester: at 60K TPM vs Groq's 8K it is the
+# difference between running and waiting out 60s windows mid-round.
 MODEL_REGISTRY: dict[str, list[str]] = {
-    "planner": ["openai/gpt-oss-20b", "openai/gpt-oss-120b"],
-    "tester": ["groq/compound-mini", "groq/compound"],
-    "coder": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"],
-    "security": ["openai/gpt-oss-safeguard-20b", "groq/compound"],
-    "reviewer": ["qwen/qwen3.6-27b", "groq/compound-mini"],
-    "arbiter": ["groq/compound", "groq/compound-mini"],
+    "planner": [
+        "cerebras:llama-3.3-70b",
+        "groq:openai/gpt-oss-20b",
+        "gemini:gemini-2.0-flash",
+        "groq:openai/gpt-oss-120b",
+    ],
+    "tester": [
+        "cerebras:qwen-3-235b-a22b-instruct-2507",
+        "nvidia:mistralai/mistral-large-2-instruct",
+        "groq:groq/compound-mini",
+        "groq:groq/compound",
+    ],
+    "coder": [
+        "cerebras:qwen-3-coder-480b",
+        "groq:openai/gpt-oss-120b",
+        "nvidia:qwen/qwen2.5-coder-32b-instruct",
+        "groq:openai/gpt-oss-20b",
+    ],
+    "security": [
+        "groq:openai/gpt-oss-safeguard-20b",
+        "nvidia:deepseek-ai/deepseek-r1",
+        "cerebras:llama-3.3-70b",
+        "groq:groq/compound",
+    ],
+    "reviewer": [
+        "groq:qwen/qwen3.6-27b",
+        "nvidia:deepseek-ai/deepseek-r1",
+        "gemini:gemini-2.5-pro",
+        "groq:groq/compound-mini",
+    ],
+    "arbiter": [
+        "nvidia:meta/llama-3.3-70b-instruct",
+        "gemini:gemini-2.5-pro",
+        "groq:groq/compound",
+        "groq:groq/compound-mini",
+    ],
 }
 
-TPM_LIMIT = 8000  # Groq's per-model-per-minute cap
 MAX_ROUNDS = 4  # coder attempts before we punt to Claude Code
 TPM_WINDOW_SECONDS = 60
 
 
-def family_of(slug: str) -> str:
-    """'openai/gpt-oss-120b' -> 'openai'; 'llama-3.3-70b-versatile' -> 'llama'."""
+def family_of(ref: str) -> str:
+    """Model family, ignoring the provider prefix.
+
+    'cerebras:llama-3.3-70b' -> 'llama'; 'groq:openai/gpt-oss-120b' -> 'openai'.
+    The provider is deliberately NOT the family: the same open-weight model
+    served by two providers shares its blind spots, so diversity has to be
+    measured on the model, not on who hosts it.
+    """
+    _, slug = split_ref(ref)
     if "/" in slug:
         return slug.split("/")[0]
     return slug.split("-")[0]
 
 
-def resolve_models(client: Groq) -> dict[str, str]:
+def live_model_refs() -> set[str]:
+    """Union of "provider:model" refs live across every configured provider.
+
+    Queried at startup rather than hardcoded: this key advertised 20+ Groq
+    models but only 6 were actually reachable, so a static list rots silently.
+    A provider that errors (bad key, outage) is skipped with a warning instead
+    of taking the whole run down.
+    """
+    refs: set[str] = set()
+    for name in available_providers():
+        try:
+            client = get_client(name)
+            for m in client.models.list().data:
+                refs.add(f"{name}:{m.id}")
+        except Exception as exc:  # noqa: BLE001 - degrade, don't abort
+            print(f"  (provider '{name}' unavailable, skipping: {type(exc).__name__})")
+    return refs
+
+
+def resolve_models(live_ids: set[str] | None = None) -> dict[str, str]:
     """Pick the first live candidate for each role. Raises RuntimeError with
     a specific, actionable message rather than letting a dead slug surface
     as an opaque 404 mid-swarm."""
-    live_ids = {m.id for m in client.models.list().data}
+    if live_ids is None:
+        live_ids = live_model_refs()
     resolved: dict[str, str] = {}
     for role, candidates in MODEL_REGISTRY.items():
-        pick = next((slug for slug in candidates if slug in live_ids), None)
+        # Normalise bare slugs to groq: so old-style entries still match.
+        pick = next(
+            (ref for ref in candidates if f"{split_ref(ref)[0]}:{split_ref(ref)[1]}" in live_ids),
+            None,
+        )
         if pick is None:
             raise RuntimeError(
-                f"No live model for role '{role}'. Tried {candidates}, none are live on this "
-                f"key. Run `python verify_key.py` to see what's currently available and update "
-                f"MODEL_REGISTRY in agent_swarm.py."
+                f"No live model for role '{role}'. Tried {candidates}, none are live on the "
+                f"configured providers ({', '.join(available_providers()) or 'none'}). Run "
+                f"`python verify_key.py` to see what's available and update MODEL_REGISTRY."
             )
         resolved[role] = pick
 
@@ -138,16 +207,14 @@ def get_anthropic_client():
 
 
 # ---------------------------------------------------------------------------
-# Token budgeting. Groq's free tier enforces an 8000 TPM cap *per model*, and
-# it counts prompt + max_tokens together — a real run measured a 413 at 8013
-# requested against that limit even though our naive chars/4 estimate said
-# we had room. Two corrections for that: a more conservative (higher) token
-# estimate, and a safety margin below the real 8000 ceiling so estimation
-# error and per-message formatting overhead (role tags, etc., which aren't
-# in the raw text length) don't tip us over anyway.
+# Token budgeting. Each provider enforces its own TPM cap *per model*
+# (Groq ~8000, Cerebras 60000, ...), and Groq counts prompt + max_tokens
+# together — a real run measured a 413 at 8013 requested even though our
+# naive chars/4 estimate said we had room. Two corrections for that: a more
+# conservative (higher) token estimate, and a per-provider safety margin so
+# estimation error and per-message formatting overhead don't tip us over.
 # ---------------------------------------------------------------------------
-BUFFER_FOR_OVERHEAD = 700  # headroom below Groq's real 8000 TPM cap
-EFFECTIVE_LIMIT = TPM_LIMIT - BUFFER_FOR_OVERHEAD
+BUFFER_FOR_OVERHEAD = 700  # headroom below each provider's real TPM cap
 
 
 def estimate_tokens(text: str) -> int:
@@ -158,42 +225,53 @@ def estimate_tokens(text: str) -> int:
 
 
 class TokenBudget:
-    def __init__(self, limit_per_request: int = EFFECTIVE_LIMIT):
-        self.limit_per_request = limit_per_request
-        self._windows: dict[str, list[tuple[float, int]]] = {}  # model -> [(timestamp, tokens)]
+    """Tracks TPM usage per "provider:model" ref, each against ITS OWN
+    provider's limit. A single global cap (the old design) would either
+    starve Cerebras's 60K budget down to Groq's 8K, or blow through Groq's
+    real cap by applying Cerebras's — providers are not interchangeable
+    here."""
 
-    def completion_cap(self, prompt_text: str) -> int:
-        """Max completion tokens we can ask for without blowing the
+    def __init__(self):
+        self._windows: dict[str, list[tuple[float, int]]] = {}  # ref -> [(timestamp, tokens)]
+
+    def _limit_for(self, ref: str) -> int:
+        provider, _ = split_ref(ref)
+        try:
+            return get_tpm_limit(provider) - BUFFER_FOR_OVERHEAD
+        except ValueError:
+            return 8000 - BUFFER_FOR_OVERHEAD  # unknown provider: fall back conservative
+
+    def completion_cap(self, ref: str, prompt_text: str) -> int:
+        """Max completion tokens we can ask for without blowing this ref's
         per-request cap. Floored at 512 (reasoning models need headroom for
         hidden <think> tokens before visible output). Capped at 3500 so
-        gpt-oss-120b has room to emit full implementations without truncation."""
-        remaining = self.limit_per_request - estimate_tokens(prompt_text)
+        large models have room to emit full implementations without
+        truncation, even on providers with a much bigger ceiling."""
+        remaining = self._limit_for(ref) - estimate_tokens(prompt_text)
         return max(512, min(remaining, 3500))
 
-    def record(self, model: str, tokens_used: int) -> None:
+    def record(self, ref: str, tokens_used: int) -> None:
         now = time.time()
-        if model not in self._windows:
-            self._windows[model] = []
-        # Clean old entries outside the window
-        self._windows[model] = [(t, n) for t, n in self._windows[model] if now - t < TPM_WINDOW_SECONDS]
-        self._windows[model].append((now, tokens_used))
+        if ref not in self._windows:
+            self._windows[ref] = []
+        self._windows[ref] = [(t, n) for t, n in self._windows[ref] if now - t < TPM_WINDOW_SECONDS]
+        self._windows[ref].append((now, tokens_used))
 
-    def wait_if_needed(self, model: str, upcoming_tokens: int) -> None:
+    def wait_if_needed(self, ref: str, upcoming_tokens: int) -> None:
         now = time.time()
-        if model not in self._windows:
-            self._windows[model] = []
-        # Clean old entries outside the window
-        self._windows[model] = [(t, n) for t, n in self._windows[model] if now - t < TPM_WINDOW_SECONDS]
-        used = sum(n for _, n in self._windows[model])
-        # Groq enforces 8000 TPM per model, not a shared pool
-        if used + upcoming_tokens > TPM_LIMIT:
-            if self._windows[model]:
-                sleep_for = TPM_WINDOW_SECONDS - (now - self._windows[model][0][0])
+        if ref not in self._windows:
+            self._windows[ref] = []
+        self._windows[ref] = [(t, n) for t, n in self._windows[ref] if now - t < TPM_WINDOW_SECONDS]
+        used = sum(n for _, n in self._windows[ref])
+        limit = self._limit_for(ref) + BUFFER_FOR_OVERHEAD  # compare against the real cap, not the padded one
+        if used + upcoming_tokens > limit:
+            if self._windows[ref]:
+                sleep_for = TPM_WINDOW_SECONDS - (now - self._windows[ref][0][0])
                 if sleep_for > 0:
-                    print(f"  (waiting {sleep_for:.0f}s — {model} at {used} TPM, upcoming request needs {upcoming_tokens})")
+                    print(f"  (waiting {sleep_for:.0f}s — {ref} at {used} TPM, upcoming request needs {upcoming_tokens})")
                     time.sleep(sleep_for)
             else:
-                raise RuntimeError(f"Requested {upcoming_tokens} tokens for {model}, but cap is {TPM_LIMIT} TPM and a single request cannot fit")
+                raise RuntimeError(f"Requested {upcoming_tokens} tokens for {ref}, but cap is {limit} TPM and a single request cannot fit")
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +314,7 @@ def _find_truncation_point(text: str, max_chars: int) -> int:
 ELISION_MARKER = "\n\n[... middle truncated for budget ...]\n\n"
 
 
-def _fit_user_text(system: str, user: str, budget: TokenBudget) -> str:
+def _fit_user_text(system: str, user: str, budget: TokenBudget, ref: str) -> str:
     """If system + user + the minimum floor completion would already blow
     the per-request cap, truncate user (the variable-length part — usually
     criteria/tests + task + feedback) rather than let the request 413.
@@ -248,7 +326,7 @@ def _fit_user_text(system: str, user: str, budget: TokenBudget) -> str:
     useful, and the elision marker is only emitted when something was
     actually removed."""
     floor = 3500  # must match completion_cap's cap so truncation reserves enough room
-    available_for_user = (budget.limit_per_request - floor) - estimate_tokens(system)
+    available_for_user = (budget._limit_for(ref) - floor) - estimate_tokens(system)
     available_chars = max(0, available_for_user * 3)  # inverse of estimate_tokens' ceil(len/3)
     if len(user) <= available_chars:
         return user
@@ -270,15 +348,22 @@ def _fit_user_text(system: str, user: str, budget: TokenBudget) -> str:
     return head + ELISION_MARKER + tail
 
 
-def complete(client: Groq, budget: TokenBudget, model: str, system: str, user: str, temperature: float) -> str:
-    """Call Groq with exponential backoff on 429/503."""
-    user = _fit_user_text(system, user, budget)
+def complete(budget: TokenBudget, ref: str, system: str, user: str, temperature: float) -> str:
+    """Call the ref's provider with exponential backoff on 429/503.
+
+    ref is a "provider:model" string (e.g. "cerebras:llama-3.3-70b"); a bare
+    slug with no colon defaults to groq. One client per call keeps this
+    stateless with respect to which provider each role landed on this run."""
+    provider, model = split_ref(ref)
+    client = get_client(provider)
+
+    user = _fit_user_text(system, user, budget, ref)
     prompt_text = system + user
-    max_tokens = budget.completion_cap(prompt_text)
+    max_tokens = budget.completion_cap(ref, prompt_text)
 
     max_retries = 3
     for attempt in range(max_retries):
-        budget.wait_if_needed(model, estimate_tokens(prompt_text) + max_tokens)
+        budget.wait_if_needed(ref, estimate_tokens(prompt_text) + max_tokens)
         try:
             resp = client.chat.completions.create(
                 model=model,
@@ -290,16 +375,17 @@ def complete(client: Groq, budget: TokenBudget, model: str, system: str, user: s
                 ],
             )
             usage = resp.usage
-            budget.record(model, getattr(usage, "total_tokens", estimate_tokens(prompt_text) + max_tokens))
+            budget.record(ref, getattr(usage, "total_tokens", estimate_tokens(prompt_text) + max_tokens))
             return resp.choices[0].message.content or ""
-        except groq.APIStatusError as exc:
-            if exc.status_code in {429, 503} and attempt < max_retries - 1:
+        except (openai.APIStatusError, groq.APIStatusError) as exc:
+            status = getattr(exc, "status_code", None)
+            if status in {429, 503} and attempt < max_retries - 1:
                 wait_time = 2 ** attempt  # 1s, 2s, 4s
                 print(f"  (rate limited; retrying in {wait_time}s...)")
                 time.sleep(wait_time)
                 continue
-            raise RuntimeError(f"Groq API call to {model} failed ({exc.status_code}): {exc.message}") from exc
-    raise RuntimeError(f"Groq API call to {model} failed after {max_retries} retries")
+            raise RuntimeError(f"API call to {ref} failed ({status}): {exc}") from exc
+    raise RuntimeError(f"API call to {ref} failed after {max_retries} retries")
 
 
 def extract_verdict(review: str) -> tuple[str, str]:
@@ -387,14 +473,17 @@ def parse_and_write_files(coder_output: str, workspace_root: Path, allow_tests: 
 
 
 def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = None) -> int:
-    api_key = os.environ.get("GROQ_API_KEY", "").strip()
-    if not api_key:
-        print("[FAIL] GROQ_API_KEY is not set. Copy .env.example to .env and paste your key in.")
+    providers = available_providers()
+    if not providers:
+        print(
+            "[FAIL] No provider API keys are set. Copy .env.example to .env and paste at "
+            "least GROQ_API_KEY in — see .env.example for the other free providers."
+        )
         return 1
+    print(f"Providers: {', '.join(providers)}")
 
-    client = Groq(api_key=api_key)
     try:
-        models = resolve_models(client)
+        models = resolve_models()
     except RuntimeError as exc:
         print(f"[FAIL] {exc}")
         return 1
@@ -439,7 +528,7 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
     print("--- planning ---")
     try:
         print("  Planner is thinking...")
-        criteria = complete(client, budget, models["planner"], planner_persona, f"Task:\n{task}", temperature=0.3)
+        criteria = complete(budget, models["planner"], planner_persona, f"Task:\n{task}", temperature=0.3)
     except RuntimeError as exc:
         print(f"[FAIL] {exc}")
         return 1
@@ -449,7 +538,7 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
     try:
         print("  Tester is writing tests...")
         tester_user = f"Acceptance criteria:\n{criteria}\n\nWrite tests based on these criteria, not implementation."
-        tests_output = complete(client, budget, models["tester"], tester_persona, tester_user, temperature=0.3)
+        tests_output = complete(budget, models["tester"], tester_persona, tester_user, temperature=0.3)
         try:
             test_files = parse_and_write_files(tests_output, workspace_root, allow_tests=True)
             if not test_files:
@@ -487,7 +576,7 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
 
         try:
             print("  Coder is working...")
-            attempt = complete(client, budget, models["coder"], coder_persona, coder_user, temperature=0.3)
+            attempt = complete(budget, models["coder"], coder_persona, coder_user, temperature=0.3)
 
             # Parse and write files (excluding tests, which are Tester's domain)
             print("  Writing implementation...")
@@ -520,7 +609,7 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
                     print("  Security is checking...")
                     security_user = f"Task:\n{task}\n\nCode:\n{attempt}"
                     try:
-                        security_output = complete(client, budget, models["security"], security_persona, security_user, temperature=0.2)
+                        security_output = complete(budget, models["security"], security_persona, security_user, temperature=0.2)
                         security_verdict, _ = extract_verdict(security_output)
                         if security_verdict == "REJECT":
                             print(f"  [Security] Issues found")
@@ -538,7 +627,7 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
                 if review is None:
                     print("  Reviewer is auditing...")
                     review_user = f"Task:\n{task}\n\nAcceptance criteria:\n{criteria}\n\nCoder's submission:\n{attempt}\n\nTest results:\n{test_note}"
-                    review = complete(client, budget, models["reviewer"], reviewer_persona, review_user, temperature=0.2)
+                    review = complete(budget, models["reviewer"], reviewer_persona, review_user, temperature=0.2)
 
         except RuntimeError as exc:
             print(f"[FAIL] {exc}")
@@ -566,7 +655,7 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
             print("  Verdict unclear; retrying...")
             retry_prompt = f"Task:\n{task}\n\nCode:\n{attempt[:500]}\n\nPlease state: VERDICT: APPROVE or VERDICT: REJECT (one line only)."
             try:
-                review = complete(client, budget, models["reviewer"], reviewer_persona, retry_prompt, temperature=0.2)
+                review = complete(budget, models["reviewer"], reviewer_persona, retry_prompt, temperature=0.2)
                 verdict, reasoning = extract_verdict(review)
                 if verdict == "APPROVE" and not sandbox_result["passed"]:
                     verdict = "REJECT"
@@ -591,7 +680,7 @@ def run_swarm(task: str, max_rounds: int = MAX_ROUNDS, repo_path: str | None = N
             # without ever being shown the test results.
             arbiter_user += f"Test results for the final attempt:\n{test_note}\n\nBreak the deadlock."
             try:
-                arbiter_review = complete(client, budget, models["arbiter"], arbiter_persona, arbiter_user, temperature=0.2)
+                arbiter_review = complete(budget, models["arbiter"], arbiter_persona, arbiter_user, temperature=0.2)
                 arbiter_verdict, arbiter_reasoning = extract_verdict(arbiter_review)
                 if arbiter_verdict == "APPROVE" and not sandbox_result["passed"]:
                     print("  (Arbiter APPROVE overridden — tests are still failing)")
