@@ -1,7 +1,8 @@
 # Swarm_Corp
 
-A 7-role coding swarm — Planner → Tester → Coder ⇄ Sandbox ⇄ Security/Architect/Reviewer
-→ Arbiter — running entirely on free LLM provider tiers, with Claude Code as
+A 10-role coding swarm — Planner → Product Critic → Tester → Coder ⇄ Sandbox ⇄
+Debugger/Security/Architect/Reviewer → Arbiter → Optimizer — running entirely
+on free LLM provider tiers, with Claude Code as
 the manual escalation lane. See [`CLAUDE.md`](CLAUDE.md) for the constraints
 this project runs under — read it before changing `swarm_corp.py`.
 
@@ -42,18 +43,21 @@ python swarm_corp.py "add a /health endpoint with a test"
 
 ## What happens
 
-The Planner writes acceptance criteria. The Tester writes tests against those
-criteria *without seeing any implementation*. The Coder implements against
-both — its output runs in a sandbox, gets audited once by Security and once
-by the Architect (structural, informational only), then reviewed by a model
-from a different family than the Coder. If Coder and Reviewer deadlock for
-3 rounds, an Arbiter breaks the tie.
+The Planner writes acceptance criteria; the Product Critic challenges them
+before a single test exists. The Tester writes tests against those criteria
+*without seeing any implementation*. The Coder implements against both — on
+red tests, the Debugger turns the traceback into a targeted diagnosis before
+the Coder sees it. Once tests pass, the code gets audited once by Security
+and once by the Architect (structural, informational only), then reviewed by
+a model from a different family than the Coder. If Coder and Reviewer
+deadlock for 3 rounds, an Arbiter breaks the tie. Once approved, the
+Optimizer runs once for an efficiency pass (also informational only).
 
 **No role can force an APPROVE while the test suite is red** — that's enforced
 in code, not merely prompted for.
 
 Each run writes to `swarm_output/`:
-- `<timestamp>/` — the generated code, tests, and `ARCHITECTURE.md`
+- `<timestamp>/` — the generated code, tests, `ARCHITECTURE.md`, and `PERFORMANCE.md`
 - `<timestamp>-<status>.md` — full round-by-round transcript
 - `<timestamp>-<status>.json` — metrics (tokens per model, wall-clock, rounds)
 
@@ -62,7 +66,7 @@ transcript to Claude Code, not to re-run it.
 
 ## Layout
 
-- `swarm_corp.py` — orchestration loop, all 7 roles
+- `swarm_corp.py` — orchestration loop, all 10 roles
 - `providers.py` — multi-provider client (10 working providers + Ollama)
 - `sandbox.py` — runs Coder output for evidence-based verdicts
 - `tools.py` / `gates.py` / `redact.py` — tool access, human approval gates, secret redaction

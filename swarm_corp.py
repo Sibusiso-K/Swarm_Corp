@@ -129,6 +129,30 @@ MODEL_REGISTRY: dict[str, list[str]] = {
         "gemini:gemini-pro-latest",
         "groq:groq/compound",
     ],
+    # Runs on red tests only, before feedback reaches the Coder. Wants a
+    # strong reasoner — diagnosing a root cause from a traceback is closer
+    # to the Arbiter's job than a quick classification.
+    "debugger": [
+        "groq:groq/compound",
+        "mistral:mistral-medium-2508",
+        "nvidia:meta/llama-3.3-70b-instruct",
+        "groq:groq/compound-mini",
+    ],
+    # Runs once after approval, informational only — not a gate.
+    "optimizer": [
+        "gemini:gemini-pro-latest",
+        "cerebras:llama-3.3-70b",
+        "cohere:c4ai-aya-expanse-32b",
+        "groq:groq/compound",
+    ],
+    # Runs right after the Planner, before the Tester — cheap, fast check,
+    # not a deep reasoning task.
+    "product_critic": [
+        "groq:openai/gpt-oss-20b",
+        "gemini:gemini-3.6-flash",
+        "groq:qwen/qwen3.6-27b",
+        "mistral:mistral-medium-2508",
+    ],
 }
 
 # Phase 5: every role runs on the local model in --private mode. Family
@@ -745,6 +769,9 @@ def _run_pipeline(
     security_persona = load_persona("security.md")
     arbiter_persona = load_persona("arbiter.md")
     architect_persona = load_persona("architect.md")
+    debugger_persona = load_persona("debugger.md")
+    optimizer_persona = load_persona("optimizer.md")
+    product_critic_persona = load_persona("product_critic.md")
 
     rubric_path = ROOT / "RUBRIC.md"
     if rubric_path.exists():
@@ -781,6 +808,9 @@ def _run_pipeline(
     ui.note(f"Reviewer : {models['reviewer']}")
     ui.note(f"Arbiter  : {models['arbiter']}")
     ui.note(f"Architect: {models['architect']}")
+    ui.note(f"Debugger : {models['debugger']}")
+    ui.note(f"Optimizer: {models['optimizer']}")
+    ui.note(f"P.Critic : {models['product_critic']}")
     if repo_context:
         ui.note(f"Repo     : {repo_path}\n")
     else:
@@ -818,6 +848,24 @@ def _run_pipeline(
         print(f"[FAIL] {exc}")
         return 1
 
+    # Product Critic: challenges the criteria before a single test is
+    # written. Non-gating — a REJECT here folds its note into what the
+    # Tester sees rather than looping back to the Planner.
+    ui.status("--- product critique ---")
+    try:
+        ui.start_role("Product Critic", models["product_critic"])
+        critic_user = f"Task:\n{task}\n\nAcceptance criteria:\n{criteria}"
+        critic_output = complete(budget, models["product_critic"], product_critic_persona, critic_user, temperature=0.3, on_chunk=ui.stream_chunk)
+        ui.end_role()
+        critic_verdict, critic_reasoning = extract_verdict(critic_output)
+        if critic_verdict == "REJECT":
+            ui.status("  [Product Critic] Flagged the criteria")
+            criteria = f"{criteria}\n\nProduct Critic's note:\n{critic_reasoning}"
+        else:
+            ui.status("  [Product Critic] Criteria look solid")
+    except RuntimeError as exc:
+        ui.status(f"  [Product Critic] Skipped (call failed: {exc})")
+
     # Phase 2: Tester writes tests based on criteria
     ui.status("--- testing (independent) ---")
     try:
@@ -837,6 +885,19 @@ def _run_pipeline(
     except RuntimeError as exc:
         print(f"[FAIL] {exc}")
         return 1
+
+    def _run_optimizer(final_code: str) -> None:
+        # Runs once, only after approval — correctness is settled by then,
+        # so a failure here is a missed nicety, never worth failing the run.
+        try:
+            ui.start_role("Optimizer", models["optimizer"])
+            optimizer_user = f"Task:\n{task}\n\nCode:\n{final_code}"
+            optimizer_output = complete(budget, models["optimizer"], optimizer_persona, optimizer_user, temperature=0.2, on_chunk=ui.stream_chunk)
+            ui.end_role()
+            (workspace_root / "PERFORMANCE.md").write_text(optimizer_output, encoding="utf-8")
+            ui.status("  [Optimizer] Wrote PERFORMANCE.md")
+        except RuntimeError as exc:
+            ui.status(f"  [Optimizer] Skipped (call failed: {exc})")
 
     # Phase 3: Main loop — Coder revises until approved
     feedback = ""
@@ -911,7 +972,20 @@ def _run_pipeline(
             if not sandbox_result["passed"] and (sandbox_result["stderr"] or sandbox_result["stdout"]):
                 ui.status("  [Auto-reject] Tests failed")
                 output = sandbox_result["stderr"] or sandbox_result["stdout"]
-                synthetic_review = f"VERDICT: REJECT\n\nTests failed — fix the implementation:\n{output}"
+                # Debugger turns raw pytest output into a targeted diagnosis
+                # before it reaches the Coder, instead of the Coder re-reading
+                # the same traceback each round. Falls back to the raw output
+                # if the call itself fails — never blocks the reject path.
+                try:
+                    ui.start_role("Debugger", models["debugger"])
+                    debugger_user = f"Failing test output:\n{output}\n\nCoder's attempt:\n{attempt}"
+                    debugger_output = complete(budget, models["debugger"], debugger_persona, debugger_user, temperature=0.2, on_chunk=ui.stream_chunk)
+                    ui.end_role()
+                    _, diagnosis = extract_verdict(debugger_output)
+                    synthetic_review = f"VERDICT: REJECT\n\nDebugger's diagnosis:\n{diagnosis}\n\nRaw test output:\n{output}"
+                except RuntimeError as exc:
+                    ui.status(f"  [Debugger] Skipped (call failed: {exc})")
+                    synthetic_review = f"VERDICT: REJECT\n\nTests failed — fix the implementation:\n{output}"
                 review = synthetic_review
             else:
                 # Tests passed; run Security check (once, after first pass)
@@ -974,6 +1048,7 @@ def _run_pipeline(
         history.append({"round": str(round_no), "attempt": attempt, "review": review, "verdict": verdict})
 
         if verdict == "APPROVE":
+            _run_optimizer(attempt)
             _write_output(task, history, approved=True)
             print(f"\n[OK] Approved after {round_no} round(s). Output written to swarm_output/.")
             return 0
@@ -991,6 +1066,7 @@ def _run_pipeline(
                     reasoning = "Tests are still failing, so this cannot be approved."
                 ui.status(f"  Verdict (retry): {verdict}")
                 if verdict == "APPROVE":
+                    _run_optimizer(attempt)
                     _write_output(task, history, approved=True)
                     print(f"\n[OK] Approved after {round_no} round(s). Output written to swarm_output/.")
                     return 0
@@ -1020,6 +1096,7 @@ def _run_pipeline(
                 ui.status(f"  Arbiter: {arbiter_verdict}")
                 history.append({"round": "arbiter", "attempt": attempt, "review": arbiter_review, "verdict": arbiter_verdict})
                 if arbiter_verdict == "APPROVE":
+                    _run_optimizer(attempt)
                     _write_output(task, history, approved=True)
                     print("\n[OK] Arbiter approved. Output written to swarm_output/.")
                     return 0

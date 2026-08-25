@@ -1,6 +1,6 @@
 # Swarm_Corp — project brief
 
-A 6-role coding swarm running entirely on free LLM provider tiers, with
+A 10-role coding swarm running entirely on free LLM provider tiers, with
 Claude Code as the manual escalation lane when the swarm can't close a task
 on its own. Two things exist in this project. Nothing else:
 
@@ -12,11 +12,15 @@ That's it. There is no Kilo Code, no jcode, no other harness or IDE
 extension in this project's design. If you find a doc or comment implying
 otherwise, it's stale — fix it to match this file.
 
-## The 7 roles
+## The 10 roles
 
-Planner → Tester → **[** Coder ⇄ Sandbox ⇄ Security/Architect/Reviewer **]** → Arbiter
+Planner → Product Critic → Tester → **[** Coder ⇄ Sandbox ⇄ Debugger ⇄ Security/Architect/Reviewer **]** → Arbiter → Optimizer
 
 - **Planner** writes acceptance criteria from the task.
+- **Product Critic** challenges those criteria immediately after — real
+  problem vs. literal wording, missing unhappy paths, over-scoping — before
+  the Tester writes a single test. Non-gating; a REJECT folds its note into
+  the criteria the Tester sees, not a retry loop.
 - **Tester** writes tests against those criteria *before* seeing any
   implementation — this is what makes the tests an independent check
   instead of the Coder grading its own homework.
@@ -25,6 +29,10 @@ Planner → Tester → **[** Coder ⇄ Sandbox ⇄ Security/Architect/Reviewer *
 - **Sandbox** (`sandbox.py`) actually runs the tests via `sys.executable`
   (never a bare `"python"` string — that resolves to system Python, not the
   venv, and silently never runs anything).
+- **Debugger** runs only on red tests, before feedback reaches the Coder —
+  turns raw pytest output into a targeted root-cause diagnosis instead of
+  making the Coder re-read the same traceback each round. Falls back to raw
+  test output if the call itself fails.
 - **Security** audits once, after the first round that passes tests.
 - **Architect** audits structure (coupling, duplication, layering) once,
   alongside Security, and writes `ARCHITECTURE.md`. Deliberately **not** a
@@ -35,6 +43,10 @@ Planner → Tester → **[** Coder ⇄ Sandbox ⇄ Security/Architect/Reviewer *
   startup — audits the implementation.
 - **Arbiter** breaks a round-3 deadlock, and sees the same test evidence
   the Reviewer did.
+- **Optimizer** runs once, only after approval — correctness is already
+  settled, so it looks only at algorithmic complexity and access patterns,
+  writing `PERFORMANCE.md`. Also not a gate; a failed call is a missed
+  nicety, never a reason to fail an approved run.
 
 **No role can force an APPROVE while the test suite is red.** This is a
 hard gate in code (`run_swarm()`), applied after every verdict extraction —
@@ -96,7 +108,7 @@ demonstrated it's stuck.
 
 ```
 Swarm_Corp/
-├── swarm_corp.py         # the whole orchestration loop, all 7 roles
+├── swarm_corp.py         # the whole orchestration loop, all 10 roles
 ├── providers.py          # multi-provider client abstraction
 ├── sandbox.py            # runs Coder output for evidence-based verdicts
 ├── tools.py              # file/web/git access — free reads vs gated writes
@@ -105,8 +117,9 @@ Swarm_Corp/
 ├── ui.py                 # Rich live streaming terminal (--plain to disable)
 ├── context.py            # --repo file-tree/sample loader
 ├── verify_key.py         # run this first, and any time something breaks
-├── agents/               # 7 personas: planner, tester, coder, security,
-│                         #   architect, reviewer, arbiter
+├── agents/               # 10 personas: planner, product_critic, tester,
+│                         #   coder, debugger, security, architect,
+│                         #   reviewer, arbiter, optimizer
 ├── templates/            # --template <name>: domain hints for the Planner
 ├── bench/                # prompt-strategy (zero/one/few-shot) comparison
 ├── RUBRIC.md              # loaded into the Reviewer's prompt at runtime
